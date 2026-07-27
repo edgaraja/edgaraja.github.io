@@ -18,6 +18,12 @@ let BlackKingPos;
 let pieceCount = 0;
 var playAsW = false;
 var playAsB = false;
+var halfMoveClock = 0;
+var positionHistory = new Map();
+var gameOver = false;
+var evalBarWhiteFill = null;
+var evalBarLabel = null;
+var boardFlipped = false;
 
 const None = 0;
 const Pawn = 1;
@@ -91,6 +97,102 @@ function createBoard() {
         pos -= 16;
     }
     container.appendChild(board);
+}
+
+function createEvalBar() {
+    var wrapper = document.createElement("div");
+    wrapper.style.display = "flex";
+    wrapper.style.flexDirection = "column";
+    wrapper.style.alignItems = "center";
+    wrapper.style.marginRight = "12px";
+
+    var bar = document.createElement("div");
+    bar.style.width = "34px";
+    bar.style.height = "600px";
+    bar.style.background = "#3a3a3a";
+    bar.style.border = "1px solid #222";
+    bar.style.position = "relative";
+    bar.style.overflow = "hidden";
+    bar.style.flexShrink = "0";
+
+    var whiteFill = document.createElement("div");
+    whiteFill.style.position = "absolute";
+    whiteFill.style.left = "0";
+    whiteFill.style.bottom = "0";
+    whiteFill.style.width = "100%";
+    whiteFill.style.height = "50%";
+    whiteFill.style.background = lightColor;
+    whiteFill.style.transition = "height 0.3s ease";
+    bar.appendChild(whiteFill);
+
+    var label = document.createElement("div");
+    label.style.marginTop = "6px";
+    label.style.fontSize = "13px";
+    label.style.fontFamily = "sans-serif";
+    label.style.fontWeight = "bold";
+    label.style.color = "#eee";
+    label.textContent = "0.0";
+
+    wrapper.appendChild(bar);
+    wrapper.appendChild(label);
+    container.insertBefore(wrapper, container.firstChild);
+
+    evalBarWhiteFill = whiteFill;
+    evalBarLabel = label;
+}
+
+// Maps a static eval (in pawns, White's perspective) to a white-share
+// percentage using the same style of sigmoid lichess/chess.com use for
+// their eval bars: small edges move the bar noticeably, large ones
+// saturate smoothly instead of slamming straight to 0%/100%.
+function evalToWhitePercent(score) {
+    var winFrac = 2 / (1 + Math.exp(-0.4 * score)) - 1; // -1..1
+    var percent = 50 + 50 * winFrac;
+    return Math.max(2, Math.min(98, percent));
+}
+
+// Instant static evaluation (no search) so this can update after every
+// move, human or AI, with no added delay.
+function updateEvalBar() {
+    if (!evalBarWhiteFill) return;
+    var score = Evaluate(true, boardPosition);
+    var whitePercent = evalToWhitePercent(score);
+    evalBarWhiteFill.style.height = whitePercent + "%";
+    evalBarLabel.textContent = score >= 0 ? "+" + score.toFixed(1) : score.toFixed(1);
+}
+
+// Re-flows the 64 tiles into their visual slots via the CSS `order`
+// property, keyed off boardFlipped. Tile identity (id, click handlers,
+// piece classes, any dynamically-added children like the promotion menu)
+// never changes — only which grid slot each tile renders in — so nothing
+// else in the game logic needs to know or care about orientation.
+function applyBoardOrientation() {
+    for (let i = 0; i < 64; i++) {
+        const engineRank = Math.floor(i / 8);
+        const engineCol = i % 8;
+        const visualRow = boardFlipped ? engineRank : 7 - engineRank;
+        const visualCol = boardFlipped ? 7 - engineCol : engineCol;
+        document.getElementById(i).style.order = visualRow * 8 + visualCol;
+    }
+}
+
+function createFlipButton() {
+    var btn = document.createElement("button");
+    btn.textContent = "Flip Board";
+    btn.style.display = "block";
+    btn.style.margin = "16px auto";
+    btn.style.padding = "8px 20px";
+    btn.style.fontSize = "16px";
+    btn.style.cursor = "pointer";
+    btn.style.background = "#769656";
+    btn.style.color = "#fff";
+    btn.style.border = "none";
+    btn.style.borderRadius = "4px";
+    btn.addEventListener("click", function () {
+        boardFlipped = !boardFlipped;
+        applyBoardOrientation();
+    });
+    document.body.appendChild(btn);
 }
 
 function getAttackedPosition(boardPos, color) {
@@ -386,6 +488,172 @@ function getAttackedPosition(boardPos, color) {
     return newAttPos;
 }
 
+// Like getAttackedPosition, but answers "is this one square attacked by
+// byColor?" by scanning outward from `square` and stopping at the first
+// piece found in each direction, instead of building an attack map for
+// every square on the board. Used on the legality-check hot path, where
+// getAttackedPosition's full-board scan was the dominant search cost.
+function isSquareAttacked(boardPos, square, byColor) {
+    // Straight lines (rook/queen)
+    let r1 = square;
+    while (r1 <= 55) {
+        r1 += 8;
+        if (boardPos[r1].type != None) {
+            if (boardPos[r1].color == byColor && (boardPos[r1].type == Rook || boardPos[r1].type == Queen)) return true;
+            break;
+        }
+    }
+    let r2 = square;
+    while (r2 >= 8) {
+        r2 -= 8;
+        if (boardPos[r2].type != None) {
+            if (boardPos[r2].color == byColor && (boardPos[r2].type == Rook || boardPos[r2].type == Queen)) return true;
+            break;
+        }
+    }
+    let r3 = square;
+    while (diff(fileAt(square), fileAt(r3 - 1)) == 0) {
+        r3 -= 1;
+        if (boardPos[r3].type != None) {
+            if (boardPos[r3].color == byColor && (boardPos[r3].type == Rook || boardPos[r3].type == Queen)) return true;
+            break;
+        }
+    }
+    let r4 = square;
+    while (diff(fileAt(square), fileAt(r4 + 1)) == 0) {
+        r4 += 1;
+        if (boardPos[r4].type != None) {
+            if (boardPos[r4].color == byColor && (boardPos[r4].type == Rook || boardPos[r4].type == Queen)) return true;
+            break;
+        }
+    }
+
+    // Diagonals (bishop/queen)
+    let d1 = square;
+    while (d1 <= 56 && diff(fileAt(d1), fileAt(d1 + 7)) == 1) {
+        d1 += 7;
+        if (boardPos[d1].type != None) {
+            if (boardPos[d1].color == byColor && (boardPos[d1].type == Bishop || boardPos[d1].type == Queen)) return true;
+            break;
+        }
+    }
+    let d2 = square;
+    while (d2 <= 54 && diff(fileAt(d2), fileAt(d2 + 9)) == 1) {
+        d2 += 9;
+        if (boardPos[d2].type != None) {
+            if (boardPos[d2].color == byColor && (boardPos[d2].type == Bishop || boardPos[d2].type == Queen)) return true;
+            break;
+        }
+    }
+    let d3 = square;
+    while (d3 >= 7 && diff(fileAt(d3), fileAt(d3 - 7)) == 1) {
+        d3 -= 7;
+        if (boardPos[d3].type != None) {
+            if (boardPos[d3].color == byColor && (boardPos[d3].type == Bishop || boardPos[d3].type == Queen)) return true;
+            break;
+        }
+    }
+    let d4 = square;
+    while (d4 >= 9 && diff(fileAt(d4), fileAt(d4 - 9)) == 1) {
+        d4 -= 9;
+        if (boardPos[d4].type != None) {
+            if (boardPos[d4].color == byColor && (boardPos[d4].type == Bishop || boardPos[d4].type == Queen)) return true;
+            break;
+        }
+    }
+
+    // Knight
+    if (square <= 63 - 15) {
+        let p = square + 15;
+        if (diff(fileAt(square), fileAt(p)) == 2 && diff(rankAt(square), rankAt(p)) == 1 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square <= 63 - 17) {
+        let p = square + 17;
+        if (diff(fileAt(square), fileAt(p)) == 2 && diff(rankAt(square), rankAt(p)) == 1 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square <= 63 - 6) {
+        let p = square + 6;
+        if (diff(fileAt(square), fileAt(p)) == 1 && diff(rankAt(square), rankAt(p)) == 2 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square <= 63 - 10) {
+        let p = square + 10;
+        if (diff(fileAt(square), fileAt(p)) == 1 && diff(rankAt(square), rankAt(p)) == 2 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square >= 15) {
+        let p = square - 15;
+        if (diff(fileAt(square), fileAt(p)) == 2 && diff(rankAt(square), rankAt(p)) == 1 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square >= 17) {
+        let p = square - 17;
+        if (diff(fileAt(square), fileAt(p)) == 2 && diff(rankAt(square), rankAt(p)) == 1 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square >= 6) {
+        let p = square - 6;
+        if (diff(fileAt(square), fileAt(p)) == 1 && diff(rankAt(square), rankAt(p)) == 2 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+    if (square >= 10) {
+        let p = square - 10;
+        if (diff(fileAt(square), fileAt(p)) == 1 && diff(rankAt(square), rankAt(p)) == 2 && boardPos[p].color == byColor && boardPos[p].type == Knight) return true;
+    }
+
+    // King
+    if (square <= 55) {
+        let p = square + 8;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (square >= 8) {
+        let p = square - 8;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (diff(fileAt(square), fileAt(square - 1)) == 0) {
+        let p = square - 1;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (diff(fileAt(square), fileAt(square + 1)) == 0) {
+        let p = square + 1;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (square <= 56 && diff(fileAt(square), fileAt(square + 7)) == 1) {
+        let p = square + 7;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (square <= 54 && diff(fileAt(square), fileAt(square + 9)) == 1) {
+        let p = square + 9;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (square >= 7 && diff(fileAt(square), fileAt(square - 7)) == 1) {
+        let p = square - 7;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+    if (square >= 9 && diff(fileAt(square), fileAt(square - 9)) == 1) {
+        let p = square - 9;
+        if (boardPos[p].color == byColor && boardPos[p].type == King) return true;
+    }
+
+    // Pawn
+    if (byColor == White) {
+        if (square - 7 >= 0 && diff(rankAt(square), rankAt(square - 7)) == 1) {
+            let p = square - 7;
+            if (boardPos[p].color == White && boardPos[p].type == Pawn) return true;
+        }
+        if (square - 9 >= 0 && diff(rankAt(square), rankAt(square - 9)) == 1) {
+            let p = square - 9;
+            if (boardPos[p].color == White && boardPos[p].type == Pawn) return true;
+        }
+    } else {
+        if (square + 7 <= 63 && diff(rankAt(square), rankAt(square + 7)) == 1) {
+            let p = square + 7;
+            if (boardPos[p].color == Black && boardPos[p].type == Pawn) return true;
+        }
+        if (square + 9 <= 63 && diff(rankAt(square), rankAt(square + 9)) == 1) {
+            let p = square + 9;
+            if (boardPos[p].color == Black && boardPos[p].type == Pawn) return true;
+        }
+    }
+
+    return false;
+}
+
 function showAttackedPosition(attPos) {
     for (let i = 0; i < 64; i++) {
         let tileTo = document.getElementById(i);
@@ -407,17 +675,20 @@ function isMoveValidForCastle(move, WKPos, BKPos, Bpos) {
         kingPos = BKPos;
         color = White;
     }
-    let attPos = getAttackedPosition(Bpos, color);
-    if (isChecked(kingPos, attPos)) {
+    // King cannot castle out of check
+    if (isSquareAttacked(Bpos, kingPos, color)) {
         return false;
-    } else {
-        return isMoveValid(move, WKPos, BKPos, Bpos);
     }
+    // King cannot pass through an attacked square
+    const intermediatePos = move.castleType === "s" ? move.pos + 1 : move.pos - 1;
+    if (isSquareAttacked(Bpos, intermediatePos, color)) {
+        return false;
+    }
+    return isMoveValid(move, WKPos, BKPos, Bpos);
 }
 
 function isMoveValid(move, WKPos, BKPos, Bpos) {
     let boardPos = moveToBoard(move, Bpos);
-    // console.log(boardPos[59]);
     if (move.piece.type == King) {
         if (move.piece.color == Black) {
             BKPos = move.posTo;
@@ -434,13 +705,7 @@ function isMoveValid(move, WKPos, BKPos, Bpos) {
         color = White;
         kingPos = BKPos;
     }
-    let attPos = getAttackedPosition(boardPos, color);
-    // console.log(boardPos);
-    if (isChecked(kingPos, attPos)) {
-        return false;
-    } else {
-        return true;
-    }
+    return !isSquareAttacked(boardPos, kingPos, color);
 }
 
 function isChecked(kingPos, attPos) {
@@ -451,7 +716,7 @@ function isChecked(kingPos, attPos) {
 }
 
 function moveToBoard(move, boardPos) {
-    let newBoardPos = JSON.parse(JSON.stringify(boardPos));
+    let newBoardPos = boardPos.slice();
     if (!move.isCastle && !move.isPromoted && !move.isEnp) {
         newBoardPos[move.pos] = new Piece(None, None);
         newBoardPos[move.posTo] = move.piece;
@@ -634,7 +899,6 @@ function generatePieces(FEN) {
 
 function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, lm) {
     let moveList = [];
-    piece.isMoved = true;
     if (piece.color == White && color == White) {
         if (pos >= 8 && pos <= 15) {
             if (boardPos[pos + 8].type == None) {
@@ -873,7 +1137,6 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
 
 function getKnightMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos) {
     let moveList = [];
-    piece.isMoved = true;
 
     if (piece.color == color) {
         if (pos <= 63 - 15) {
@@ -955,7 +1218,6 @@ function getKnightMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos)
 
 function getBishopMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos) {
     let moveList = [];
-    piece.isMoved = true;
 
     let pos1 = pos;
     let pos2 = pos;
@@ -1046,6 +1308,7 @@ function getBishopMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos)
 
 function getRookMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
+    piece = new Piece(piece.color, piece.type);
     piece.isMoved = true;
 
     let pos1 = pos;
@@ -1120,7 +1383,6 @@ function getRookMoves(pos, piece, color, boardPos, WKPos, BKPos) {
 
 function getQueenMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
-    piece.isMoved = true;
 
     let pos1 = pos;
     let pos2 = pos;
@@ -1274,6 +1536,7 @@ function getQueenMoves(pos, piece, color, boardPos, WKPos, BKPos) {
 
 function getKingMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
+    piece = new Piece(piece.color, piece.type);
     piece.isMoved = true;
     if (piece.color == color) {
         if (pos <= 55) {
@@ -1478,7 +1741,59 @@ function removeEventListener() {
     }
 }
 
+function showGameOver(msg) {
+    gameOver = true;
+    var overlay = document.createElement("div");
+    overlay.className = "game-over-overlay";
+    var box = document.createElement("div");
+    box.className = "game-over-box";
+    var text = document.createElement("p");
+    text.textContent = msg;
+    var btn = document.createElement("button");
+    btn.textContent = "New Game";
+    btn.addEventListener("click", function () { location.reload(); });
+    box.appendChild(text);
+    box.appendChild(btn);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+}
+
+function squareColor(sq) {
+    return (Math.floor(sq / 8) + sq % 8) % 2;
+}
+
+function checkInsufficientMaterial() {
+    var whitePieces = [];
+    var blackPieces = [];
+    for (var i = 0; i < 64; i++) {
+        if (boardPosition[i].color == White && boardPosition[i].type != None) {
+            whitePieces.push({ type: boardPosition[i].type, sq: i });
+        } else if (boardPosition[i].color == Black && boardPosition[i].type != None) {
+            blackPieces.push({ type: boardPosition[i].type, sq: i });
+        }
+    }
+    // K vs K
+    if (whitePieces.length == 1 && blackPieces.length == 1) return true;
+    // K+minor vs K
+    if (whitePieces.length == 2 && blackPieces.length == 1) {
+        var minor = whitePieces.find(function (p) { return p.type != King; });
+        if (minor.type == Bishop || minor.type == Knight) return true;
+    }
+    if (blackPieces.length == 2 && whitePieces.length == 1) {
+        var minor = blackPieces.find(function (p) { return p.type != King; });
+        if (minor.type == Bishop || minor.type == Knight) return true;
+    }
+    // K+B vs K+B same square color
+    if (whitePieces.length == 2 && blackPieces.length == 2) {
+        var wb = whitePieces.find(function (p) { return p.type == Bishop; });
+        var bb = blackPieces.find(function (p) { return p.type == Bishop; });
+        if (wb && bb && squareColor(wb.sq) === squareColor(bb.sq)) return true;
+    }
+    return false;
+}
+
 async function movePiece(move) {
+    if (gameOver) return;
     if (!move.isCastle && !move.isPromoted && !move.isEnp) {
         boardPosition[move.pos] = new Piece(None, None);
         boardPosition[move.posTo] = move.piece;
@@ -1532,7 +1847,51 @@ async function movePiece(move) {
         tileTo.classList.add("lightClicked2");
     }
     showPiece(boardPosition);
+    updateEvalBar();
     await sleep(10);
+
+    // Half-move clock: reset on any pawn move or capture, else increment
+    if (move.piece.type === Pawn || move.attPiece.type !== None || move.isEnp) {
+        halfMoveClock = 0;
+    } else {
+        halfMoveClock++;
+    }
+
+    // 50-move rule (100 half-moves = 50 full moves each side)
+    if (halfMoveClock >= 100) {
+        showGameOver("Draw by 50-move rule");
+        return;
+    }
+
+    // Threefold repetition — uses the Zobrist hash already computed for the TT
+    var posHash = computeHash(boardPosition, whiteToMove);
+    var repCount = (positionHistory.get(posHash) || 0) + 1;
+    positionHistory.set(posHash, repCount);
+    if (repCount >= 3) {
+        showGameOver("Draw by threefold repetition");
+        return;
+    }
+
+    // Insufficient material
+    if (checkInsufficientMaterial()) {
+        showGameOver("Draw by insufficient material");
+        return;
+    }
+
+    // Checkmate / stalemate: check if the side now to move has any legal moves
+    var legalMoves = getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos);
+    if (legalMoves.length === 0) {
+        var attackingColor = whiteToMove ? Black : White;
+        var kingPos = whiteToMove ? WhiteKingPos : BlackKingPos;
+        var attPos = getAttackedPosition(boardPosition, attackingColor);
+        if (isChecked(kingPos, attPos)) {
+            showGameOver("Checkmate — " + (whiteToMove ? "Black" : "White") + " wins!");
+        } else {
+            showGameOver("Stalemate — Draw");
+        }
+        return;
+    }
+
     moveCntr++;
     if (playAsW) {
         if (!whiteToMove) {
@@ -1548,6 +1907,7 @@ async function movePiece(move) {
 }
 
 function showedMoveClicked(e) {
+    if (gameOver) return;
     if (e.button == 0) {
         let moveIndex = this.getAttribute("moveindex");
         let move = nextMoves[moveIndex];
@@ -1730,6 +2090,7 @@ function showMove() {
     for (let i = 0; i < 64; i++) {
         let pcs = document.getElementById(i);
         pcs.addEventListener("mousedown", function (e) {
+            if (gameOver) return;
             if (e.button == 0) {
                 if (pcs.classList.contains("moveList") || pcs.classList.contains("moveListCapture")) {
                     removeShowedMove();
@@ -1771,14 +2132,7 @@ function getAllMoves(WTM, boardPos, lm, WKPos, BKPos) {
     } else {
         color = Black;
     }
-    let newBoardPos = JSON.parse(JSON.stringify(boardPos));
-    // let newBoardPos = boardPos.map(function (arr) {
-    //     return arr.slice();
-    // });
-    // let newBoardPos = boardPos.slice(0);
-    // console.log(color);
-    newBoardPos.forEach((piece) => {
-        // if (lm.pos == 59 && lm.posTo == 38) console.log(piece);
+    boardPos.forEach((piece) => {
         if (piece.type == Pawn) {
             moveList = moveList.concat(getPawnMoves(pos, piece, color, boardPos, WKPos, BKPos, lm));
         } else if (piece.type == King) {
@@ -1868,7 +2222,10 @@ function playAsBlack() {
 // window.onload(function () {
 // });
 
+createEvalBar();
 createBoard();
+createFlipButton();
+applyBoardOrientation();
 generatePieces(defaultFEN);
 // generatePieces("r1b1kbr1/ppqnp2B/5p1n/2pPp1p1/8/2N1BN2/PPP2PPP/R2Q1RK1 w q - 0 1");
 // generatePieces("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w");
@@ -1881,3 +2238,10 @@ generatePieces(defaultFEN);
 showPiece(boardPosition);
 // getAllMoves();
 showMove();
+
+// Seed position history and the eval bar's initial reading.
+// Runs after ai.js is loaded so computeHash/Evaluate are available.
+window.addEventListener("load", function () {
+    positionHistory.set(computeHash(boardPosition, whiteToMove), 1);
+    updateEvalBar();
+});

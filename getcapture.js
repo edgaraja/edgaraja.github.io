@@ -1,6 +1,5 @@
 function getCapturePawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, lm) {
     let moveList = [];
-    piece.isMoved = true;
     if (piece.color == White && color == White) {
         if (pos + 7 <= 63) {
             if (diff(rankAt(pos), rankAt(pos + 7)) == 1) {
@@ -161,7 +160,6 @@ function getCapturePawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKin
 
 function getCaptureKnightMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos) {
     let moveList = [];
-    piece.isMoved = true;
 
     if (piece.color == color) {
         if (pos <= 63 - 15) {
@@ -243,7 +241,6 @@ function getCaptureKnightMoves(pos, piece, color, boardPos, whiteKingPos, blackK
 
 function getCaptureBishopMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos) {
     let moveList = [];
-    piece.isMoved = true;
 
     let pos1 = pos;
     let pos2 = pos;
@@ -322,6 +319,7 @@ function getCaptureBishopMoves(pos, piece, color, boardPos, whiteKingPos, blackK
 
 function getCaptureRookMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
+    piece = new Piece(piece.color, piece.type);
     piece.isMoved = true;
 
     let pos1 = pos;
@@ -384,7 +382,6 @@ function getCaptureRookMoves(pos, piece, color, boardPos, WKPos, BKPos) {
 
 function getCaptureQueenMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
-    piece.isMoved = true;
 
     let pos1 = pos;
     let pos2 = pos;
@@ -514,6 +511,7 @@ function getCaptureQueenMoves(pos, piece, color, boardPos, WKPos, BKPos) {
 
 function getCaptureKingMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
+    piece = new Piece(piece.color, piece.type);
     piece.isMoved = true;
     if (piece.color == color) {
         if (pos <= 55) {
@@ -556,7 +554,7 @@ function getCaptureKingMoves(pos, piece, color, boardPos, WKPos, BKPos) {
             if (diff(fileAt(pos), fileAt(pos + 7)) == 1) {
                 let pos1 = pos + 7;
                 if (boardPos[pos1].type != None) {
-                    if (!boardPos[pos1].color == piece.color) {
+                    if (boardPos[pos1].color != piece.color) {
                         let move = new Move(piece, pos, pos1, boardPos[pos1], false, null, false, null, false, null);
                         if (isMoveValid(move, WKPos, BKPos, boardPos)) moveList.push(move);
                     }
@@ -613,14 +611,7 @@ function getAllCaptureMoves(WTM, boardPos, lm, WKPos, BKPos) {
     } else {
         color = Black;
     }
-    let newBoardPos = JSON.parse(JSON.stringify(boardPos));
-    // let newBoardPos = boardPos.map(function (arr) {
-    //     return arr.slice();
-    // });
-    // let newBoardPos = boardPos.slice(0);
-    // console.log(color);
-    newBoardPos.forEach((piece) => {
-        // if (lm.pos == 59 && lm.posTo == 38) console.log(piece);
+    boardPos.forEach((piece) => {
         if (piece.type == Pawn) {
             moveList = moveList.concat(getCapturePawnMoves(pos, piece, color, boardPos, WKPos, BKPos, lm));
         } else if (piece.type == King) {
