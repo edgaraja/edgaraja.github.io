@@ -24,6 +24,9 @@ var gameOver = false;
 var evalBarWhiteFill = null;
 var evalBarLabel = null;
 var boardFlipped = false;
+var rankLabelEls = [];
+var fileLabelEls = [];
+var searchInfoLabel = null;
 
 const None = 0;
 const Pawn = 1;
@@ -96,7 +99,62 @@ function createBoard() {
         }
         pos -= 16;
     }
-    container.appendChild(board);
+
+    function makeLabel(width, height) {
+        var label = document.createElement("div");
+        label.style.width = width;
+        label.style.height = height;
+        label.style.display = "flex";
+        label.style.alignItems = "center";
+        label.style.justifyContent = "center";
+        label.style.color = "#ddd";
+        label.style.fontFamily = "sans-serif";
+        label.style.fontSize = "14px";
+        return label;
+    }
+
+    var rankLabels = document.createElement("div");
+    rankLabels.style.display = "flex";
+    rankLabels.style.flexDirection = "column";
+    for (let i = 0; i < 8; i++) {
+        var rankLabel = makeLabel("22px", "75px");
+        rankLabels.appendChild(rankLabel);
+        rankLabelEls.push(rankLabel);
+    }
+
+    var fileLabels = document.createElement("div");
+    fileLabels.style.display = "flex";
+    for (let i = 0; i < 8; i++) {
+        var fileLabel = makeLabel("75px", "22px");
+        fileLabels.appendChild(fileLabel);
+        fileLabelEls.push(fileLabel);
+    }
+
+    var boardAndFiles = document.createElement("div");
+    boardAndFiles.style.display = "flex";
+    boardAndFiles.style.flexDirection = "column";
+    boardAndFiles.appendChild(board);
+    boardAndFiles.appendChild(fileLabels);
+
+    var boardWithLabels = document.createElement("div");
+    boardWithLabels.style.display = "flex";
+    boardWithLabels.appendChild(rankLabels);
+    boardWithLabels.appendChild(boardAndFiles);
+
+    container.appendChild(boardWithLabels);
+}
+
+// Keeps the a-h / 1-8 labels in sync with boardFlipped. Labels are plain
+// text with no square identity to preserve, so it's simplest to just
+// recompute their text rather than reordering elements the way the tiles
+// themselves are (via CSS `order` in applyBoardOrientation).
+function updateBoardLabels() {
+    for (let r = 0; r < 8; r++) {
+        rankLabelEls[r].textContent = boardFlipped ? String(r + 1) : String(8 - r);
+    }
+    for (let c = 0; c < 8; c++) {
+        fileLabelEls[c].textContent = String.fromCharCode(97 + (boardFlipped ? 7 - c : c));
+    }
 }
 
 function createEvalBar() {
@@ -191,8 +249,25 @@ function createFlipButton() {
     btn.addEventListener("click", function () {
         boardFlipped = !boardFlipped;
         applyBoardOrientation();
+        updateBoardLabels();
     });
     document.body.appendChild(btn);
+}
+
+// Shows the AI's own search depth and evaluation from its last move — unlike
+// the eval bar (instant static eval, no search), this reflects what the
+// engine actually calculated. Updated from playAi2() itself (ai.js), since
+// only it knows its own depth/score; stays blank until the AI has moved at
+// least once.
+function createSearchInfoLabel() {
+    var label = document.createElement("div");
+    label.style.textAlign = "center";
+    label.style.color = "#ddd";
+    label.style.fontFamily = "sans-serif";
+    label.style.fontSize = "14px";
+    label.style.margin = "8px 0";
+    document.body.appendChild(label);
+    searchInfoLabel = label;
 }
 
 function getAttackedPosition(boardPos, color) {
@@ -665,6 +740,60 @@ function showAttackedPosition(attPos) {
     }
 }
 
+// Set once per getAllMoves/getAllCaptureMoves/getMoves call (see below),
+// read by isMoveValid's fast path. Safe as module-level state because move
+// generation in this codebase is always fully synchronous and depth-first —
+// a given getAllMoves call completes and returns its whole move list before
+// anything else (including a recursive search call one ply deeper) runs, so
+// there's no way for two calls' cached values to interleave.
+let currentKingInCheck = false;
+let currentPinnedMap = null;
+
+// For the side-to-move's king at kingPos: walks all 8 directions outward
+// (same ray-walking bounds as isSquareAttacked/getAttackedPosition) looking
+// for "one friendly piece, then an enemy slider of the matching type, with
+// nothing else in between" — the classic absolute-pin pattern. For each
+// pinned piece, records the full set of squares it may still move to
+// (every square from the king outward through and including the pinner)
+// without exposing the king.
+function computePinnedPieces(boardPos, kingPos, kingColor) {
+    const enemyColor = kingColor === White ? Black : White;
+    const pinned = new Map();
+
+    const dirs = [
+        { step: 8, bound: (p) => p <= 55, guard: () => true, sliders: [Rook, Queen] },
+        { step: -8, bound: (p) => p >= 8, guard: () => true, sliders: [Rook, Queen] },
+        { step: -1, bound: () => true, guard: (p) => diff(fileAt(kingPos), fileAt(p - 1)) == 0, sliders: [Rook, Queen] },
+        { step: 1, bound: () => true, guard: (p) => diff(fileAt(kingPos), fileAt(p + 1)) == 0, sliders: [Rook, Queen] },
+        { step: 7, bound: (p) => p <= 56, guard: (p) => diff(fileAt(p), fileAt(p + 7)) == 1, sliders: [Bishop, Queen] },
+        { step: 9, bound: (p) => p <= 54, guard: (p) => diff(fileAt(p), fileAt(p + 9)) == 1, sliders: [Bishop, Queen] },
+        { step: -7, bound: (p) => p >= 7, guard: (p) => diff(fileAt(p), fileAt(p - 7)) == 1, sliders: [Bishop, Queen] },
+        { step: -9, bound: (p) => p >= 9, guard: (p) => diff(fileAt(p), fileAt(p - 9)) == 1, sliders: [Bishop, Queen] },
+    ];
+
+    for (const dir of dirs) {
+        let cur = kingPos;
+        const rayLine = [];
+        let friendlyPos = -1;
+        while (dir.bound(cur) && dir.guard(cur)) {
+            cur += dir.step;
+            rayLine.push(cur);
+            if (boardPos[cur].type != None) {
+                if (friendlyPos === -1 && boardPos[cur].color === kingColor) {
+                    friendlyPos = cur;
+                    continue;
+                }
+                if (friendlyPos !== -1 && boardPos[cur].color === enemyColor && dir.sliders.includes(boardPos[cur].type)) {
+                    pinned.set(friendlyPos, new Set(rayLine));
+                }
+                break;
+            }
+        }
+    }
+
+    return pinned;
+}
+
 function isMoveValidForCastle(move, WKPos, BKPos, Bpos) {
     let kingPos;
     let color;
@@ -688,6 +817,17 @@ function isMoveValidForCastle(move, WKPos, BKPos, Bpos) {
 }
 
 function isMoveValid(move, WKPos, BKPos, Bpos) {
+    // Fast path: if the king isn't currently in check, moving a piece that
+    // isn't pinned can never expose it — skip simulating the move and
+    // rescanning the board entirely. King moves, en passant (its rare
+    // discovered-check-via-double-pawn-removal case), and pinned pieces
+    // still need the full check below.
+    if (!currentKingInCheck && move.piece.type !== King && !move.isEnp && currentPinnedMap) {
+        const allowed = currentPinnedMap.get(move.pos);
+        if (!allowed) return true;
+        return allowed.has(move.posTo);
+    }
+
     let boardPos = moveToBoard(move, Bpos);
     if (move.piece.type == King) {
         if (move.piece.color == Black) {
@@ -1691,6 +1831,12 @@ function getMoves(pos, piece) {
     } else {
         color = Black;
     }
+
+    const ownKingPos = whiteToMove ? WhiteKingPos : BlackKingPos;
+    const enemyColor = whiteToMove ? Black : White;
+    currentKingInCheck = isSquareAttacked(boardPosition, ownKingPos, enemyColor);
+    currentPinnedMap = currentKingInCheck ? null : computePinnedPieces(boardPosition, ownKingPos, color);
+
     let moveList = [];
     if (piece.type == Pawn) {
         moveList = moveList.concat(getPawnMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos, lastMove));
@@ -2132,6 +2278,12 @@ function getAllMoves(WTM, boardPos, lm, WKPos, BKPos) {
     } else {
         color = Black;
     }
+
+    const ownKingPos = WTM ? WKPos : BKPos;
+    const enemyColor = WTM ? Black : White;
+    currentKingInCheck = isSquareAttacked(boardPos, ownKingPos, enemyColor);
+    currentPinnedMap = currentKingInCheck ? null : computePinnedPieces(boardPos, ownKingPos, color);
+
     boardPos.forEach((piece) => {
         if (piece.type == Pawn) {
             moveList = moveList.concat(getPawnMoves(pos, piece, color, boardPos, WKPos, BKPos, lm));
@@ -2225,7 +2377,9 @@ function playAsBlack() {
 createEvalBar();
 createBoard();
 createFlipButton();
+createSearchInfoLabel();
 applyBoardOrientation();
+updateBoardLabels();
 generatePieces(defaultFEN);
 // generatePieces("r1b1kbr1/ppqnp2B/5p1n/2pPp1p1/8/2N1BN2/PPP2PPP/R2Q1RK1 w q - 0 1");
 // generatePieces("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w");

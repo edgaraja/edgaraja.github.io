@@ -611,6 +611,12 @@ function getAllCaptureMoves(WTM, boardPos, lm, WKPos, BKPos) {
     } else {
         color = Black;
     }
+
+    const ownKingPos = WTM ? WKPos : BKPos;
+    const enemyColor = WTM ? Black : White;
+    currentKingInCheck = isSquareAttacked(boardPos, ownKingPos, enemyColor);
+    currentPinnedMap = currentKingInCheck ? null : computePinnedPieces(boardPos, ownKingPos, color);
+
     boardPos.forEach((piece) => {
         if (piece.type == Pawn) {
             moveList = moveList.concat(getCapturePawnMoves(pos, piece, color, boardPos, WKPos, BKPos, lm));
