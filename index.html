@@ -5,15 +5,52 @@
         <meta http-equiv="X-UA-Compatible" content="IE=edge" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Chess</title>
+        <style>
+            body {
+                background: #51504d;
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                font-family: sans-serif;
+            }
+            h1 {
+                color: #eeeed2;
+                font-size: 42px;
+                margin: 0 0 40px;
+                letter-spacing: 2px;
+            }
+            .menu {
+                display: flex;
+                flex-direction: column;
+                gap: 16px;
+                width: 260px;
+            }
+            .menu a {
+                display: block;
+                text-align: center;
+                text-decoration: none;
+                color: #fff;
+                background: #769656;
+                padding: 14px 0;
+                border-radius: 6px;
+                font-size: 18px;
+                font-weight: bold;
+                transition: background 0.15s ease;
+            }
+            .menu a:hover {
+                background: #5a7a3a;
+            }
+        </style>
     </head>
     <body>
-        <a href="./PlayAsWhite.html">Play As White</a>
-        <br />
-        <a href="./PlayAsBlack.html">Play As Black</a>
-        <br />
-        <a href="./AiVsAi.html">Ai VS Ai</a>
+        <h1>Chess</h1>
+        <div class="menu">
+            <a href="./PlayAsWhite.html">Play As White</a>
+            <a href="./PlayAsBlack.html">Play As Black</a>
+            <a href="./AiVsAi.html">AI vs AI</a>
+        </div>
     </body>
-    <script src="chess.js"></script>
-    <script src="ai.js"></script>
-    <script src="getcapture.js"></script>
 </html>
