@@ -15,6 +15,14 @@ onmessage = function (e) {
     pieceCount = data.pieceCount;
     positionHistory = data.positionHistory;
 
-    const move = playAi2();
+    // rootMoveSubset/deadline/hardDeadline are only present when this worker
+    // is part of a root-splitting pool (chess.js's requestAiMove); a plain
+    // single-worker dispatch omits them, giving playAi2() its original,
+    // unrestricted behavior.
+    const move = playAi2(
+        data.rootMoveSubset
+            ? { rootMoveSubset: data.rootMoveSubset, deadline: data.deadline, hardDeadline: data.hardDeadline }
+            : undefined
+    );
     postMessage({ move, lastSearchDepth, lastSearchScore, lastSearchTimeMs });
 };

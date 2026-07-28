@@ -32,9 +32,17 @@ var boardFlipped = false;
 var rankLabelEls = [];
 var fileLabelEls = [];
 var searchInfoLabel = null;
-let aiWorker = null;
+// One worker per pool slot for root-splitting parallel search (see
+// requestAiMove below): navigator.hardwareConcurrency isn't available
+// inside a Worker's own realm the same way it matters here, so this is only
+// ever meaningfully read on the main thread, where it decides how many
+// workers to actually create.
+let aiWorkerPool = [];
 let aiThinking = false;
-let pendingAiReject = null;
+// One pending-reject slot per pool worker, indexed the same way
+// aiWorkerPool is -- lets a specific worker's onerror reject only its own
+// in-flight request instead of guessing which request was in flight.
+let pendingAiRejects = [];
 
 const None = 0;
 const Pawn = 1;
@@ -1229,20 +1237,75 @@ function checkInsufficientMaterial() {
     return false;
 }
 
-// Sends a snapshot of the current position to the AI worker and resolves
-// with its response. Reassigning aiWorker.onmessage per call (rather than a
-// persistent listener + request-id demultiplexing) is safe because
-// aiThinking guarantees only one search is ever outstanding at a time.
+// Root-splitting parallel search: book moves are checked directly here
+// (instant, no worker needed); otherwise the full legal root-move list is
+// generated once (main thread) and split round-robin across the worker
+// pool, so each worker gets a representative mix of promising/weak moves
+// rather than one worker getting every competitive candidate. Each worker
+// runs its own full independent search (playAi2 with options.rootMoveSubset,
+// ai.js) against a shared wall-clock deadline; once all respond, the best
+// result is picked from the SIDE-TO-MOVE'S perspective -- lastSearchScore is
+// always normalized to White's perspective (see ai.js), so this must take
+// the max when White is to move but the min when Black is, never a raw
+// cross-worker max.
 function requestAiMove() {
-    return new Promise((resolve, reject) => {
-        pendingAiReject = reject;
-        aiWorker.onmessage = function (e) {
-            pendingAiReject = null;
-            resolve(e.data);
-        };
-        aiWorker.postMessage({
-            boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos, pieceCount, positionHistory,
-        });
+    const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
+    if (bookMove) {
+        return Promise.resolve({ move: bookMove, lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: 0 });
+    }
+
+    const color = whiteToMove ? Black : White;
+    const rootMoves = sortMoves(
+        getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
+        getAttackedPosition(boardPosition, color),
+        null,
+        boardPosition
+    );
+
+    const workerCount = aiWorkerPool.length;
+    const subsets = [];
+    for (let i = 0; i < workerCount; i++) subsets.push([]);
+    for (let i = 0; i < rootMoves.length; i++) subsets[i % workerCount].push(rootMoves[i]);
+
+    const deadline = Date.now() + AI_BASE_TIME_MS;
+    const hardDeadline = Date.now() + AI_MAX_TIME_MS;
+
+    const requests = [];
+    for (let i = 0; i < workerCount; i++) {
+        if (subsets[i].length === 0) continue;
+        const worker = aiWorkerPool[i];
+        requests.push(
+            new Promise((resolve, reject) => {
+                pendingAiRejects[i] = reject;
+                worker.onmessage = function (e) {
+                    pendingAiRejects[i] = null;
+                    resolve(e.data);
+                };
+                worker.postMessage({
+                    boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos, pieceCount, positionHistory,
+                    rootMoveSubset: subsets[i], deadline, hardDeadline,
+                });
+            })
+        );
+    }
+
+    return Promise.all(requests).then((results) => {
+        let best = null;
+        let bestOriented = -Infinity;
+        let maxTimeMs = 0;
+        for (const r of results) {
+            if (r.lastSearchTimeMs > maxTimeMs) maxTimeMs = r.lastSearchTimeMs;
+            if (!r.move) continue;
+            const oriented = whiteToMove ? r.lastSearchScore : -r.lastSearchScore;
+            if (best === null || oriented > bestOriented) {
+                best = r;
+                bestOriented = oriented;
+            }
+        }
+        if (best === null) {
+            return { move: null, lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: maxTimeMs };
+        }
+        return { move: best.move, lastSearchDepth: best.lastSearchDepth, lastSearchScore: best.lastSearchScore, lastSearchTimeMs: maxTimeMs };
     });
 }
 
@@ -1757,15 +1820,28 @@ if (typeof document !== "undefined") {
     // getAllMoves();
     showMove();
 
-    aiWorker = new Worker("ai-worker.js");
-    aiWorker.onerror = function (e) {
-        console.error("AI worker error:", e.message, e);
-        if (pendingAiReject) {
-            const reject = pendingAiReject;
-            pendingAiReject = null;
-            reject(e);
-        }
-    };
+    // Root-splitting parallel search (requestAiMove above): one worker per
+    // pool slot, reused for the whole game. Reserve one core for this UI
+    // thread; fall back to a single worker -- today's exact original
+    // behavior -- when core count can't be detected.
+    const aiWorkerCount =
+        typeof navigator !== "undefined" && navigator.hardwareConcurrency >= 2
+            ? Math.max(1, Math.min(navigator.hardwareConcurrency - 1, 6))
+            : 1;
+    for (let i = 0; i < aiWorkerCount; i++) {
+        const worker = new Worker("ai-worker.js");
+        worker.onerror = (function (index) {
+            return function (e) {
+                console.error("AI worker error:", e.message, e);
+                if (pendingAiRejects[index]) {
+                    const reject = pendingAiRejects[index];
+                    pendingAiRejects[index] = null;
+                    reject(e);
+                }
+            };
+        })(i);
+        aiWorkerPool.push(worker);
+    }
 
     // Seed position history and the eval bar's initial reading.
     // Runs after ai.js is loaded so computeHash/Evaluate are available.

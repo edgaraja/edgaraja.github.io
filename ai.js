@@ -1392,20 +1392,44 @@ function updateSearchInfo() {
     searchInfoLabel.textContent = "Depth " + lastSearchDepth + "  ·  Eval " + display + "  ·  " + lastSearchTimeMs + "ms";
 }
 
-function playAi2() {
+// `options.rootMoveSubset`, when given, restricts the root loop to searching
+// only that (already-generated, already-legal) subset of moves instead of
+// the position's full legal move list -- used by the root-splitting worker
+// pool (chess.js's requestAiMove) so each worker only ever searches its own
+// slice. Omitting `options` entirely (the only way this was ever called
+// before root-splitting existed) is byte-identical to the original
+// behavior: book-move check included, full move generation every depth.
+function playAi2(options) {
     const searchStartTime = Date.now();
+    options = options || {};
+    const usingSubset = !!options.rootMoveSubset;
 
-    const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
-    if (bookMove) {
+    if (!usingSubset) {
+        const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
+        if (bookMove) {
+            lastSearchDepth = 0;
+            lastSearchScore = null;
+            lastSearchTimeMs = Date.now() - searchStartTime;
+            updateSearchInfo();
+            return bookMove;
+        }
+    }
+
+    // A worker handed zero moves (only possible if there are fewer legal
+    // moves than pool workers) has nothing to search -- return immediately
+    // rather than spinning through 40 empty depth iterations until the
+    // deadline. The real orchestrator never dispatches an empty subset, so
+    // this is defensive, not something production traffic exercises.
+    if (usingSubset && options.rootMoveSubset.length === 0) {
         lastSearchDepth = 0;
         lastSearchScore = null;
         lastSearchTimeMs = Date.now() - searchStartTime;
         updateSearchInfo();
-        return bookMove;
+        return null;
     }
 
-    searchDeadline = Date.now() + AI_BASE_TIME_MS;
-    const hardDeadline = Date.now() + AI_MAX_TIME_MS;
+    searchDeadline = options.deadline || Date.now() + AI_BASE_TIME_MS;
+    const hardDeadline = options.hardDeadline || Date.now() + AI_MAX_TIME_MS;
     searchAborted = false;
     resetSearchState();
 
@@ -1413,6 +1437,16 @@ function playAi2() {
     // iterative-deepening passes) rather than being rederived from scratch
     // at every node below — see updateHashForMove.
     const rootHash = computeHash(boardPosition, whiteToMove);
+
+    // Also invariant across depths when using a fixed subset: move
+    // *generation* (and the attacked-square map sortMoves needs) never
+    // changes mid-call, only move *ordering* does (see below) -- computed
+    // once here instead of every iteration.
+    let attackedPosForSubset = null;
+    if (usingSubset) {
+        const subsetColor = whiteToMove ? Black : White;
+        attackedPosForSubset = getAttackedPosition(boardPosition, subsetColor);
+    }
 
     let bestMove = null;
     let firstLegalMove = null;
@@ -1432,14 +1466,26 @@ function playAi2() {
     // depth's complete answer, as long as at least one root move (the
     // best-ordered one, searched first) was cleanly evaluated at this depth.
     for (let depth = 1; depth <= 40; depth++) {
-        const color = whiteToMove ? Black : White;
-        const attackedPos = getAttackedPosition(boardPosition, color);
-        let rootMoves = sortMoves(
-            getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
-            attackedPos,
-            null,
-            boardPosition
-        );
+        let rootMoves;
+        if (usingSubset) {
+            // Re-sort (not just re-copy) every depth: sortMoves orders quiet
+            // moves by historyTable/killer state, which keeps accumulating
+            // across depths within this call -- reusing a stale sort would
+            // search every depth after the first in a cold, uninformed
+            // order, quietly forfeiting depth. Move *generation* is what's
+            // skippable here (already done once by the orchestrator), not
+            // move *ordering*.
+            rootMoves = sortMoves(options.rootMoveSubset.slice(), attackedPosForSubset, null, boardPosition);
+        } else {
+            const color = whiteToMove ? Black : White;
+            const attackedPos = getAttackedPosition(boardPosition, color);
+            rootMoves = sortMoves(
+                getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
+                attackedPos,
+                null,
+                boardPosition
+            );
+        }
         if (firstLegalMove === null && rootMoves.length > 0) firstLegalMove = rootMoves[0];
 
         // Bring the previous iteration's best move to the front of root list
@@ -1550,7 +1596,16 @@ function playAi2() {
             lastSearchDepth = depth;
             lastSearchScore = whiteToMove ? depthScore : -depthScore; // always from White's perspective, matching the eval bar
 
-            if (!depthAborted && depth >= AI_EXTEND_MIN_DEPTH && (moveChanged || scoreDropped)) {
+            // Only extend when NOT using a subset: with a small slice of the
+            // full move list, "the best move among my few candidates
+            // changed" is a much noisier signal than it is when comparing
+            // the whole position's moves, so subset workers would extend
+            // far more readily than a single full-list search ever did. The
+            // orchestrator waits for every pooled worker (Promise.all), so
+            // even one worker doing this turns the whole batch's wall time
+            // into whatever its slowest, most-extended straggler takes --
+            // silently erasing the parallel speedup this pool exists for.
+            if (!usingSubset && !depthAborted && depth >= AI_EXTEND_MIN_DEPTH && (moveChanged || scoreDropped)) {
                 // The answer just shifted or the score just dropped -- this
                 // position needs more room before committing to it, rather
                 // than cutting off on the original schedule.
@@ -1562,7 +1617,12 @@ function playAi2() {
         }
         if (depthAborted) break;
         if (depthScore !== null && depthScore > 900000) break; // forced mate found, no need to search deeper
-        if (rootMoves.length <= 1) break; // nothing left to iterate on
+        // "Nothing left to iterate on" only means the whole position is
+        // forced when this loop sees ALL legal moves. With a subset, a
+        // small rootMoves.length just means this worker got a small slice
+        // of a much bigger move list -- it must not stop early on that
+        // basis alone.
+        if (!usingSubset && rootMoves.length <= 1) break;
         if (Date.now() >= searchDeadline) break;
     }
 
