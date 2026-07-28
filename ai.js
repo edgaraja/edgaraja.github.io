@@ -47,16 +47,36 @@ let rookMap = [0, -10, 0, 0, 0, 0, -10, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 
 let queenMap = [-20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10, -5, 0, 5, 5, 5, 5, 0, -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10, -10, 0, 5, 0, 0, 0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20];
 let kingMapMiddle = [-30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -20, -30, -30, -40, -40, -30, -30, -20, -10, -20, -20, -20, -20, -20, -20, -10, 20, 20, 0, 0, 0, 0, 20, 20, 20, 30, 10, 0, 0, 10, 30, 20];
 let kingMapEnd = [-50, -40, -30, -20, -20, -30, -40, -50, -30, -20, -10, 0, 0, -10, -20, -30, -30, -10, 20, 30, 30, 20, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 20, 30, 30, 20, -10, -30, -30, -30, 0, 0, 0, 0, -30, -30, -50, -30, -30, -30, -30, -30, -30, -50];
-// .slice() before .reverse() — reverse() mutates in place, and without the
-// copy this would silently reverse the White tables above too, leaving
-// White and Black scored from the exact same (wrongly-mirrored) table.
-let pawnMapBlack = pawnMap.slice().reverse();
-let knightMapBlack = knightMap.slice().reverse();
-let bishopMapBlack = bishopMap.slice().reverse();
-let rookMapBlack = rookMap.slice().reverse();
-let queenMapBlack = queenMap.slice().reverse();
-let kingMapBlackMiddle = kingMapMiddle.slice().reverse();
-let kingMapBlackEnd = kingMapEnd.slice().reverse();
+
+// Endgame variants for the two pieces whose positional value shifts most
+// clearly and uncontroversially between phases (same "row 0 = rank 8" table
+// convention as above). Pawn: advancement toward promotion becomes worth far
+// more, roughly regardless of file, rather than the middlegame table's
+// central-file emphasis. Rook: the 7th-rank bonus (cutting off the enemy
+// king, attacking pawns from behind) sharpens, while the middlegame table's
+// "-10 on the b/g files" nudge (discouraging premature rook moves before
+// castling) and slight kingside-file bias no longer apply once development
+// isn't a concern. Knight/bishop/queen deliberately keep a single table for
+// both phases -- their middlegame/endgame value shift is real but far more
+// subtle, and inventing specific numbers for it without being able to
+// actually test them empirically (self-play, tournament tuning) risks doing
+// more harm than good.
+let pawnMapEnd = [0, 0, 0, 0, 0, 0, 0, 0, 90, 90, 90, 90, 90, 90, 90, 90, 60, 60, 60, 60, 60, 60, 60, 60, 35, 35, 35, 35, 35, 35, 35, 35, 20, 20, 20, 20, 20, 20, 20, 20, 10, 10, 10, 10, 10, 10, 10, 10, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0];
+let rookMapEnd = [0, 0, 0, 0, 0, 0, 0, 0, 20, 20, 20, 20, 20, 20, 20, 20, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+// The tables above are authored in the conventional "as-diagrammed" square
+// order (row 0 = rank 8, row 7 = rank 1) — e.g. pawnMap's row 1 (all 50s)
+// is the bonus for a pawn on rank 7, one step from queening. This engine's
+// own square indexing runs the other way (0 = a1 ... 63 = h8, row 0 = rank
+// 1), so a White piece's own square must be rank-mirrored before indexing
+// into these tables, or it reads the bonus for the rank-mirrored square
+// instead (e.g. a pawn still on rank 2 would wrongly get the "one step from
+// queening" bonus). A Black piece's own advancement direction (rank 8 rank
+// 1) already matches the table's row order one-for-one, so Black indexes
+// these tables directly, unmirrored.
+function mirrorRank(i) {
+    return (7 - (i >> 3)) * 8 + (i & 7);
+}
 
 let rank = ["a", "b", "c", "d", "e", "f", "g", "h"];
 
@@ -148,9 +168,23 @@ function knightMobility(boardPos, pos, color) {
     return count;
 }
 
+// Chebyshev (king-move) distance -- how many king moves to get from one
+// square to another, since a king covers one rank/file/diagonal step at a
+// time regardless of direction.
+function kingDistance(a, b) {
+    const ar = Math.floor(a / 8), ac = a % 8;
+    const br = Math.floor(b / 8), bc = b % 8;
+    return Math.max(Math.abs(ar - br), Math.abs(ac - bc));
+}
+
 // Doubled/isolated/passed pawn scoring for one side. ownColsRows/enemyColsRows
 // are arrays of 8 columns, each holding the rows (0-7) of that color's pawns.
-function pawnStructureScore(ownColsRows, enemyColsRows, isWhite) {
+// ownKingPos/enemyKingPos add the classic "square of the pawn" consideration
+// for passed pawns: the advancement bonus alone doesn't capture that a passed
+// pawn is far more dangerous when its own king can escort it home, or far
+// less when the defending king can simply walk over and blockade it --
+// something the advancement-only bonus otherwise misses entirely.
+function pawnStructureScore(ownColsRows, enemyColsRows, isWhite, ownKingPos, enemyKingPos) {
     let score = 0;
     for (let col = 0; col < 8; col++) {
         const rows = ownColsRows[col];
@@ -176,6 +210,11 @@ function pawnStructureScore(ownColsRows, enemyColsRows, isWhite) {
             if (passed) {
                 const advance = isWhite ? row : 7 - row; // 0 at start rank, rises toward promotion
                 score += 10 + advance * 8;
+
+                const promoSquare = (isWhite ? 56 : 0) + col;
+                const ownDist = kingDistance(ownKingPos, promoSquare);
+                const enemyDist = kingDistance(enemyKingPos, promoSquare);
+                score += (enemyDist - ownDist) * 4;
             }
         }
     }
@@ -223,7 +262,23 @@ function Evaluate(WTM, boardPos) {
 
     const whitePawnColsRows = Array.from({ length: 8 }, () => []);
     const blackPawnColsRows = Array.from({ length: 8 }, () => []);
+    const whitePawnSquares = [];
+    const blackPawnSquares = [];
+    const whiteRookSquares = [];
+    const blackRookSquares = [];
+    const whiteBishopSquares = [];
+    const blackBishopSquares = [];
+    // [0] = pawns on light squares, [1] = pawns on dark squares (matches
+    // squareColor's 0/1, from chess.js) -- used by the bad-bishop penalty
+    // below, since a bishop is only hemmed in by pawns on ITS OWN color.
+    const whitePawnsByColor = [0, 0];
+    const blackPawnsByColor = [0, 0];
 
+    // Pawn/rook piece-square scoring is tapered between middlegame/endgame
+    // tables (like king below), but that blend needs the FINAL phaseAccum --
+    // known only once every piece has been scanned -- so this pass only
+    // records material, mobility, and each pawn's/rook's square; the tapered
+    // PST bonus itself is added afterward, once phase01 is known.
     for (let i = 0; i < 64; i++) {
         const p = boardPos[i];
         if (p.type == None) continue;
@@ -234,58 +289,66 @@ function Evaluate(WTM, boardPos) {
             if (p.type == King) {
                 blackKingPos = i;
             } else if (p.type == Queen) {
-                evalBlack += 900 + queenMapBlack[i] / 10;
+                evalBlack += 900 + queenMap[i] / 10;
                 evalBlack += slidingMobility(boardPos, i, Black, true) + slidingMobility(boardPos, i, Black, false);
                 phaseAccum += PHASE_QUEEN;
                 blackMaterial += 9;
             } else if (p.type == Rook) {
-                evalBlack += 500 + rookMapBlack[i] / 10;
+                evalBlack += 500;
                 evalBlack += 2 * slidingMobility(boardPos, i, Black, false);
+                blackRookSquares.push(i);
                 phaseAccum += PHASE_ROOK;
                 blackMaterial += 5;
             } else if (p.type == Knight) {
-                evalBlack += 300 + knightMapBlack[i] / 10;
+                evalBlack += 300 + knightMap[i] / 10;
                 evalBlack += 2 * knightMobility(boardPos, i, Black);
                 phaseAccum += PHASE_KNIGHT;
                 blackMaterial += 3;
             } else if (p.type == Bishop) {
-                evalBlack += 300 + bishopMapBlack[i] / 10;
+                evalBlack += 300 + bishopMap[i] / 10;
                 evalBlack += 2 * slidingMobility(boardPos, i, Black, true);
                 blackBishops++;
+                blackBishopSquares.push(i);
                 phaseAccum += PHASE_BISHOP;
                 blackMaterial += 3;
             } else if (p.type == Pawn) {
-                evalBlack += 100 + pawnMapBlack[i] / 10;
+                evalBlack += 100;
+                blackPawnSquares.push(i);
                 blackPawnColsRows[col].push(row);
+                blackPawnsByColor[squareColor(i)]++;
                 blackMaterial += 1;
             }
         } else {
             if (p.type == King) {
                 whiteKingPos = i;
             } else if (p.type == Queen) {
-                evalWhite += 900 + queenMap[i] / 10;
+                evalWhite += 900 + queenMap[mirrorRank(i)] / 10;
                 evalWhite += slidingMobility(boardPos, i, White, true) + slidingMobility(boardPos, i, White, false);
                 phaseAccum += PHASE_QUEEN;
                 whiteMaterial += 9;
             } else if (p.type == Rook) {
-                evalWhite += 500 + rookMap[i] / 10;
+                evalWhite += 500;
                 evalWhite += 2 * slidingMobility(boardPos, i, White, false);
+                whiteRookSquares.push(i);
                 phaseAccum += PHASE_ROOK;
                 whiteMaterial += 5;
             } else if (p.type == Knight) {
-                evalWhite += 300 + knightMap[i] / 10;
+                evalWhite += 300 + knightMap[mirrorRank(i)] / 10;
                 evalWhite += 2 * knightMobility(boardPos, i, White);
                 phaseAccum += PHASE_KNIGHT;
                 whiteMaterial += 3;
             } else if (p.type == Bishop) {
-                evalWhite += 300 + bishopMap[i] / 10;
+                evalWhite += 300 + bishopMap[mirrorRank(i)] / 10;
                 evalWhite += 2 * slidingMobility(boardPos, i, White, true);
                 whiteBishops++;
+                whiteBishopSquares.push(i);
                 phaseAccum += PHASE_BISHOP;
                 whiteMaterial += 3;
             } else if (p.type == Pawn) {
-                evalWhite += 100 + pawnMap[i] / 10;
+                evalWhite += 100;
+                whitePawnSquares.push(i);
                 whitePawnColsRows[col].push(row);
+                whitePawnsByColor[squareColor(i)]++;
                 whiteMaterial += 1;
             }
         }
@@ -293,29 +356,63 @@ function Evaluate(WTM, boardPos) {
 
     const phase01 = Math.min(1, phaseAccum / PHASE_MAX);
 
+    for (const sq of whitePawnSquares) {
+        const m = mirrorRank(sq);
+        evalWhite += (pawnMap[m] * phase01 + pawnMapEnd[m] * (1 - phase01)) / 10;
+    }
+    for (const sq of blackPawnSquares) {
+        evalBlack += (pawnMap[sq] * phase01 + pawnMapEnd[sq] * (1 - phase01)) / 10;
+    }
+    for (const sq of whiteRookSquares) {
+        const m = mirrorRank(sq);
+        evalWhite += (rookMap[m] * phase01 + rookMapEnd[m] * (1 - phase01)) / 10;
+    }
+    for (const sq of blackRookSquares) {
+        evalBlack += (rookMap[sq] * phase01 + rookMapEnd[sq] * (1 - phase01)) / 10;
+    }
+
     if (whiteKingPos >= 0) {
-        evalWhite += (kingMapMiddle[whiteKingPos] * phase01 + kingMapEnd[whiteKingPos] * (1 - phase01)) / 10;
+        const wk = mirrorRank(whiteKingPos);
+        evalWhite += (kingMapMiddle[wk] * phase01 + kingMapEnd[wk] * (1 - phase01)) / 10;
         evalWhite += kingSafetyScore(whiteKingPos, whitePawnColsRows, blackPawnColsRows);
     }
     if (blackKingPos >= 0) {
-        evalBlack += (kingMapBlackMiddle[blackKingPos] * phase01 + kingMapBlackEnd[blackKingPos] * (1 - phase01)) / 10;
+        evalBlack += (kingMapMiddle[blackKingPos] * phase01 + kingMapEnd[blackKingPos] * (1 - phase01)) / 10;
         evalBlack += kingSafetyScore(blackKingPos, blackPawnColsRows, whitePawnColsRows);
     }
 
     if (whiteBishops >= 2) evalWhite += 30;
     if (blackBishops >= 2) evalBlack += 30;
 
-    if (whiteKingPos >= 0 && blackKingPos >= 0) {
+    // Bad bishop: pawns fixed on the SAME square color as the bishop hem it
+    // in (it can never get past them), unlike pawns on the opposite color,
+    // which don't obstruct its diagonals at all and can even be defended by
+    // it. Scaled down in the endgame (phase01 low), where the bishop's
+    // greater range often lets it get around a pawn chain the long way.
+    for (const sq of whiteBishopSquares) {
+        evalWhite -= whitePawnsByColor[squareColor(sq)] * (2 + 2 * phase01);
+    }
+    for (const sq of blackBishopSquares) {
+        evalBlack -= blackPawnsByColor[squareColor(sq)] * (2 + 2 * phase01);
+    }
+
+    // King activity: push the stronger side's king toward the weaker one
+    // (and the weaker king toward the edge) in any real endgame with a
+    // genuine material edge -- not just the near-bare-king mop-up case.
+    // Scaled by how big the material gap is (capped once it reaches a full
+    // rook or two minors' worth) so a marginal edge doesn't get the full
+    // push before it's actually time to convert.
+    if (whiteKingPos >= 0 && blackKingPos >= 0 && phase01 < 0.5) {
         const materialDiff = whiteMaterial - blackMaterial;
-        if (blackMaterial <= 1 && materialDiff >= 3) {
-            evalWhite += endgameKingActivityScore(blackKingPos, whiteKingPos);
-        } else if (whiteMaterial <= 1 && materialDiff <= -3) {
-            evalBlack += endgameKingActivityScore(whiteKingPos, blackKingPos);
+        if (materialDiff >= 2) {
+            evalWhite += endgameKingActivityScore(blackKingPos, whiteKingPos) * Math.min(1, materialDiff / 6);
+        } else if (materialDiff <= -2) {
+            evalBlack += endgameKingActivityScore(whiteKingPos, blackKingPos) * Math.min(1, -materialDiff / 6);
         }
     }
 
-    evalWhite += pawnStructureScore(whitePawnColsRows, blackPawnColsRows, true);
-    evalBlack += pawnStructureScore(blackPawnColsRows, whitePawnColsRows, false);
+    evalWhite += pawnStructureScore(whitePawnColsRows, blackPawnColsRows, true, whiteKingPos, blackKingPos);
+    evalBlack += pawnStructureScore(blackPawnColsRows, whitePawnColsRows, false, blackKingPos, whiteKingPos);
 
     for (let i = 0; i < 64; i++) {
         const p = boardPos[i];
@@ -345,18 +442,36 @@ const TT_BETA  = 2; // lower bound (failed high / cutoff)
 const TT_SIZE  = 1 << 20; // 1,048,576 entries
 const TT_MASK  = TT_SIZE - 1;
 
+// A tiny, deterministic PRNG (mulberry32) with a fixed seed, used ONLY for
+// Zobrist table generation below. Must be deterministic (not Math.random())
+// so the AI worker -- which loads its own independent copy of this file via
+// importScripts -- computes byte-identical hashes to the main thread's. With
+// two independently-randomized tables, the worker's threefold-repetition
+// check (positionHistory.get(hash) below) would never match keys the main
+// thread inserted, silently breaking repetition detection whenever search
+// runs off-thread.
+function mulberry32(seed) {
+    return function () {
+        seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+const zobristRandom = mulberry32(0x5eed1234);
+
 // 64 squares × 12 piece slots (6 types × 2 colors), each a random uint32
 const zobristPieces = (() => {
     const t = [];
     for (let sq = 0; sq < 64; sq++) {
         t[sq] = new Uint32Array(12);
         for (let p = 0; p < 12; p++) {
-            t[sq][p] = (Math.random() * 0x100000000) >>> 0;
+            t[sq][p] = (zobristRandom() * 0x100000000) >>> 0;
         }
     }
     return t;
 })();
-const zobristBlackToMove = (Math.random() * 0x100000000) >>> 0;
+const zobristBlackToMove = (zobristRandom() * 0x100000000) >>> 0;
 const transpositionTable = new Array(TT_SIZE).fill(null);
 
 function pieceIndex(piece) {
@@ -585,7 +700,6 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
 
     for (let i = 0; i < moveList.length; i++) {
         const move = moveList[i];
-        let newBoardPos = moveToBoard(move, boardPos);
         let childWKPos = WKPos;
         let childBKPos = BKPos;
         if (move.piece.type == King) {
@@ -598,14 +712,53 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
         // full-window search. Later moves are cheaply checked with a
         // null-window search first, and only re-searched with the full
         // window if that check suggests they might actually beat alpha.
+        //
+        // Late Move Reductions: moves ordered late (i.e. everything past the
+        // hash move/killers/best-history moves sortMoves already floated to
+        // the front) are usually not the best move in the position, so their
+        // FIRST look is searched at a reduced depth instead of childDepth --
+        // cheaper, and still enough to catch a genuinely strong move, since
+        // any reduced search that beats alpha gets escalated back to
+        // childDepth (still null-window) before the existing PVS re-search
+        // logic above even runs. Skipped for captures/promotions (need full
+        // strength to evaluate correctly) and while in check (already
+        // handled by the check-extension above, and reducing on top of that
+        // is the wrong direction). This doesn't check whether the move
+        // itself delivers check -- a common refinement that would exclude a
+        // few more tactical moves from reduction, at the cost of an extra
+        // isSquareAttacked call per candidate; omitting it just means a
+        // slightly wider set of moves gets reduced, which the beats-alpha
+        // re-search safety net already covers.
+        const LMR_MIN_DEPTH = 3;
+        const LMR_MIN_MOVE_INDEX = 3;
+        const canReduce = i >= LMR_MIN_MOVE_INDEX && depth >= LMR_MIN_DEPTH && !inCheck && move.attPiece.type === None && !move.isPromoted;
+        const reduction = canReduce ? (i >= 6 ? 2 : 1) : 0;
+
+        // Make/unmake: boardPos is ONE shared, mutable array for the whole
+        // search tree (not a clone per move) -- makeMove mutates it in
+        // place and returns an undo record; the try/finally guarantees
+        // unmakeMove restores it before this iteration ends, no matter
+        // which branch below returns or whether something throws, so a
+        // future edit adding another exit path can't accidentally skip it.
         let evalScore;
-        if (i === 0) {
-            evalScore = -Search(childDepth, nextWTM, newBoardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash);
-        } else {
-            evalScore = -Search(childDepth, nextWTM, newBoardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash);
-            if (!searchAborted && evalScore > alpha && evalScore < beta) {
-                evalScore = -Search(childDepth, nextWTM, newBoardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash);
+        const undo = makeMove(move, boardPos);
+        try {
+            if (i === 0) {
+                evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash);
+            } else {
+                const reducedDepth = Math.max(0, childDepth - reduction);
+                evalScore = -Search(reducedDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash);
+                if (!searchAborted && reduction > 0 && evalScore > alpha) {
+                    // The reduced look unexpectedly beat alpha -- confirm at the
+                    // real depth before trusting it (still null-window).
+                    evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash);
+                }
+                if (!searchAborted && evalScore > alpha && evalScore < beta) {
+                    evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash);
+                }
             }
+        } finally {
+            unmakeMove(undo, boardPos);
         }
 
         if (searchAborted) return alpha;
@@ -709,17 +862,22 @@ function SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, alpha, beta) {
     }
 
     for (let i = 0; i < moveList.length; i++) {
-        let newBoardPos = moveToBoard(moveList[i], boardPos);
-        lm = moveList[i];
+        const move = moveList[i];
+        lm = move;
         let eval;
-        if (moveList[i].piece.type == King) {
-            if (moveList[i].piece.color == Black) {
-                eval = -SearchAllCapture(WTM, newBoardPos, lm, WKPos, moveList[i].posTo, -beta, -alpha);
+        const undo = makeMove(move, boardPos);
+        try {
+            if (move.piece.type == King) {
+                if (move.piece.color == Black) {
+                    eval = -SearchAllCapture(WTM, boardPos, lm, WKPos, move.posTo, -beta, -alpha);
+                } else {
+                    eval = -SearchAllCapture(WTM, boardPos, lm, move.posTo, BKPos, -beta, -alpha);
+                }
             } else {
-                eval = -SearchAllCapture(WTM, newBoardPos, lm, moveList[i].posTo, BKPos, -beta, -alpha);
+                eval = -SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, -beta, -alpha);
             }
-        } else {
-            eval = -SearchAllCapture(WTM, newBoardPos, lm, WKPos, BKPos, -beta, -alpha);
+        } finally {
+            unmakeMove(undo, boardPos);
         }
         if (eval >= beta) {
             return beta;
@@ -745,83 +903,28 @@ function pieceValue(type) {
     }
 }
 
-// All `color` pieces directly attacking `square` on the current board — the
-// same ray-walking bounds as isSquareAttacked, but collecting every match
-// per direction instead of stopping at the first. Used by SEE below.
-// Simplification: this does not reveal x-ray attackers (e.g. a rook behind
-// a rook on a file) as pieces ahead of them get simulated away during an
-// exchange — a full x-ray-aware SEE would re-scan after each capture. This
-// only occasionally misjudges batteries; it's still far more accurate than
-// plain MVV-LVA for the common case.
+// All `color` pieces directly attacking `square` on the current board, via
+// the same bitboard attack tables used throughout chess.js/getcapture.js.
+// Used by SEE below — return order doesn't matter, both call sites sort
+// immediately. Simplification: this does not reveal x-ray attackers (e.g. a
+// rook behind a rook on a file) as pieces ahead of them get simulated away
+// during an exchange — a full x-ray-aware SEE would re-scan after each
+// capture. This only occasionally misjudges batteries; it's still far more
+// accurate than plain MVV-LVA for the common case.
 function getAttackers(boardPos, square, color) {
+    const bb = syncBitboards(boardPos);
+    const oppositeOfColor = color === White ? Black : White;
     const attackers = [];
 
-    const straightDirs = [
-        { step: 8, bound: (p) => p <= 55, guard: () => true },
-        { step: -8, bound: (p) => p >= 8, guard: () => true },
-        { step: -1, bound: () => true, guard: (p) => diff(fileAt(square), fileAt(p - 1)) == 0 },
-        { step: 1, bound: () => true, guard: (p) => diff(fileAt(square), fileAt(p + 1)) == 0 },
-    ];
-    for (const dir of straightDirs) {
-        let cur = square;
-        while (dir.bound(cur) && dir.guard(cur)) {
-            cur += dir.step;
-            if (boardPos[cur].type != None) {
-                if (boardPos[cur].color == color && (boardPos[cur].type == Rook || boardPos[cur].type == Queen)) {
-                    attackers.push(boardPos[cur].type);
-                }
-                break;
-            }
-        }
-    }
+    forEachBit(and64(KNIGHT_ATTACKS[square], bb.piece[color][Knight]), () => attackers.push(Knight));
+    forEachBit(and64(KING_ATTACKS[square], bb.piece[color][King]), () => attackers.push(King));
+    forEachBit(and64(PAWN_ATTACKS[oppositeOfColor][square], bb.piece[color][Pawn]), () => attackers.push(Pawn));
 
-    const diagDirs = [
-        { step: 7, bound: (p) => p <= 56, guard: (p) => diff(fileAt(p), fileAt(p + 7)) == 1 },
-        { step: 9, bound: (p) => p <= 54, guard: (p) => diff(fileAt(p), fileAt(p + 9)) == 1 },
-        { step: -7, bound: (p) => p >= 7, guard: (p) => diff(fileAt(p), fileAt(p - 7)) == 1 },
-        { step: -9, bound: (p) => p >= 9, guard: (p) => diff(fileAt(p), fileAt(p - 9)) == 1 },
-    ];
-    for (const dir of diagDirs) {
-        let cur = square;
-        while (dir.bound(cur) && dir.guard(cur)) {
-            cur += dir.step;
-            if (boardPos[cur].type != None) {
-                if (boardPos[cur].color == color && (boardPos[cur].type == Bishop || boardPos[cur].type == Queen)) {
-                    attackers.push(boardPos[cur].type);
-                }
-                break;
-            }
-        }
-    }
+    const rookQueenBB = or64(bb.piece[color][Rook], bb.piece[color][Queen]);
+    forEachBit(and64(rookAttacks(square, bb.all), rookQueenBB), (sq) => attackers.push(boardPos[sq].type));
 
-    const knightOffsets = [
-        [15, 2, 1], [17, 2, 1], [6, 1, 2], [10, 1, 2],
-        [-15, 2, 1], [-17, 2, 1], [-6, 1, 2], [-10, 1, 2],
-    ];
-    for (const [off, fd, rd] of knightOffsets) {
-        const p = square + off;
-        if (p < 0 || p > 63) continue;
-        if (diff(fileAt(square), fileAt(p)) == fd && diff(rankAt(square), rankAt(p)) == rd) {
-            if (boardPos[p].color == color && boardPos[p].type == Knight) attackers.push(Knight);
-        }
-    }
-
-    if (square <= 55) { const p = square + 8; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (square >= 8) { const p = square - 8; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (diff(fileAt(square), fileAt(square - 1)) == 0) { const p = square - 1; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (diff(fileAt(square), fileAt(square + 1)) == 0) { const p = square + 1; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (square <= 56 && diff(fileAt(square), fileAt(square + 7)) == 1) { const p = square + 7; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (square <= 54 && diff(fileAt(square), fileAt(square + 9)) == 1) { const p = square + 9; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (square >= 7 && diff(fileAt(square), fileAt(square - 7)) == 1) { const p = square - 7; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-    if (square >= 9 && diff(fileAt(square), fileAt(square - 9)) == 1) { const p = square - 9; if (boardPos[p].color == color && boardPos[p].type == King) attackers.push(King); }
-
-    if (color == White) {
-        if (square - 7 >= 0 && diff(rankAt(square), rankAt(square - 7)) == 1) { const p = square - 7; if (boardPos[p].color == White && boardPos[p].type == Pawn) attackers.push(Pawn); }
-        if (square - 9 >= 0 && diff(rankAt(square), rankAt(square - 9)) == 1) { const p = square - 9; if (boardPos[p].color == White && boardPos[p].type == Pawn) attackers.push(Pawn); }
-    } else {
-        if (square + 7 <= 63 && diff(rankAt(square), rankAt(square + 7)) == 1) { const p = square + 7; if (boardPos[p].color == Black && boardPos[p].type == Pawn) attackers.push(Pawn); }
-        if (square + 9 <= 63 && diff(rankAt(square), rankAt(square + 9)) == 1) { const p = square + 9; if (boardPos[p].color == Black && boardPos[p].type == Pawn) attackers.push(Pawn); }
-    }
+    const bishopQueenBB = or64(bb.piece[color][Bishop], bb.piece[color][Queen]);
+    forEachBit(and64(bishopAttacks(square, bb.all), bishopQueenBB), (sq) => attackers.push(boardPos[sq].type));
 
     return attackers;
 }
@@ -838,6 +941,18 @@ function seeCapture(boardPos, move) {
     const attackerColor = move.piece.color;
     const defenderColor = attackerColor === White ? Black : White;
 
+    // Check the defender's pool first: if nothing recaptures at all, the
+    // exchange ends after this one capture and SEE is trivially just the
+    // captured piece's value -- skip computing our own attacker pool
+    // entirely (a whole second getAttackers scan + sort) since it would
+    // never be consulted anyway (most callers already skip this call
+    // altogether via the same attackedPos check, see sortMoves -- this is a
+    // defensive fast path for any other caller).
+    const theirPool = getAttackers(boardPos, square, defenderColor).map(pieceValue).sort((a, b) => a - b);
+    if (theirPool.length === 0) {
+        return pieceValue(move.attPiece.type);
+    }
+
     // getAttackers is queried against the board BEFORE the move, where the
     // moving piece is still at move.pos — since a legal capture move means
     // move.piece does attack move.posTo, it shows up in this scan too. It's
@@ -847,8 +962,6 @@ function seeCapture(boardPos, move) {
     const ourPool = getAttackers(boardPos, square, attackerColor).map(pieceValue).sort((a, b) => a - b);
     const moverIdx = ourPool.indexOf(pieceValue(move.piece.type));
     if (moverIdx !== -1) ourPool.splice(moverIdx, 1);
-
-    const theirPool = getAttackers(boardPos, square, defenderColor).map(pieceValue).sort((a, b) => a - b);
 
     const gain = [pieceValue(move.attPiece.type)];
     let occupantValue = pieceValue(move.piece.type);
@@ -870,16 +983,30 @@ function seeCapture(boardPos, move) {
 
 function sortMoves(moveList, attackedPos, depth, boardPos) {
     const killers = depth != null && depth < MAX_KILLER_DEPTH ? killerMoves[depth] : null;
-    moveList.forEach((move) => {
+    for (let i = 0; i < moveList.length; i++) {
+        const move = moveList[i];
         let moveScoreGuess = 0;
-        let movePieceType = move.piece.type;
-        let attPieceType = move.attPiece.type;
+        const movePieceType = move.piece.type;
+        const attPieceType = move.attPiece.type;
 
         if (attPieceType != None) {
             // SEE accounts for defenders, unlike plain MVV-LVA — a capture
             // that just loses material outright sorts below quiet moves
             // instead of ahead of them.
-            moveScoreGuess = boardPos ? 100 * seeCapture(boardPos, move) : 10 * pieceValue(attPieceType) - pieceValue(movePieceType);
+            if (!boardPos) {
+                moveScoreGuess = 10 * pieceValue(attPieceType) - pieceValue(movePieceType);
+            } else if (attackedPos[move.posTo] == None) {
+                // attackedPos is already the defending side's full attack
+                // map for this node (computed once, not per move) -- if it
+                // shows no defender at all on the destination square, SEE's
+                // exchange sequence would trivially resolve to just the
+                // captured piece's value with nothing left to recapture
+                // with. Skip the whole SEE computation (two getAttackers
+                // scans + sorts) and use that exact same result directly.
+                moveScoreGuess = 100 * pieceValue(attPieceType);
+            } else {
+                moveScoreGuess = 100 * seeCapture(boardPos, move);
+            }
         } else {
             // Quiet moves: order by history score, with a bonus for killer
             // moves (quiet moves that caused a cutoff elsewhere at this same
@@ -900,9 +1027,9 @@ function sortMoves(moveList, attackedPos, depth, boardPos) {
         }
 
         move.moveScoreGuess = moveScoreGuess;
-    });
+    }
 
-    moveList.sort((a, b) => (a.moveScoreGuess < b.moveScoreGuess ? 1 : -1));
+    moveList.sort((a, b) => b.moveScoreGuess - a.moveScoreGuess);
 
     return moveList;
 }
@@ -1351,6 +1478,11 @@ function playAi2() {
             for (let i = 0; i < rootMoves.length; i++) {
                 const move = rootMoves[i];
                 const newBoardPos = moveToBoard(move, boardPosition);
+                // Root of the make/unmake subtree for this move: attach a
+                // freshly-rebuilt live bitboard state that every makeMove/
+                // unmakeMove below this point will maintain incrementally in
+                // O(1), instead of resyncing from scratch on every node.
+                newBoardPos.__liveBB = syncBitboards(newBoardPos);
                 let childWKPos = WhiteKingPos;
                 let childBKPos = BlackKingPos;
                 if (move.piece.type === King) {
@@ -1443,12 +1575,8 @@ function playAi2() {
 async function AivsAi() {
     while (1) {
         if (gameOver) break;
-        let move = playAi2();
-        if (move && !gameOver) {
-            movePiece(move);
-            await sleep(10);
-        } else {
-            break;
-        }
+        await playAiTurn();
+        if (gameOver) break;
+        await sleep(10);
     }
 }
