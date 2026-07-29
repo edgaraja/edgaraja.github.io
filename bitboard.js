@@ -442,18 +442,20 @@ function rebuildBitboardsFromScratch(boardPos) {
 
     for (let sq = 0; sq < 64; sq++) {
         const p = boardPos[sq];
-        if (p.type === None) continue;
+        const pType = ((p) & 7);
+        if (pType === None) continue;
+        const pColor = ((p) & 24);
         if (sq < 32) {
             const bit = 1 << sq;
-            lo[p.color][p.type] |= bit;
+            lo[pColor][pType] |= bit;
             allLo |= bit;
-            if (p.color === White) whiteLo |= bit;
+            if (pColor === White) whiteLo |= bit;
             else blackLo |= bit;
         } else {
             const bit = 1 << (sq - 32);
-            hi[p.color][p.type] |= bit;
+            hi[pColor][pType] |= bit;
             allHi |= bit;
-            if (p.color === White) whiteHi |= bit;
+            if (pColor === White) whiteHi |= bit;
             else blackHi |= bit;
         }
     }
@@ -499,6 +501,49 @@ function verifyLiveBitboards(boardPos) {
 }
 
 // --- Attack / check / pin queries ------------------------------------------
+
+// Like bbIsSquareAttacked, but reports WHICH piece type is attacking (the
+// cheapest one, checked in ascending-value order so it's also usable as a
+// rough "what's the cheapest attacker here" query -- e.g. for a per-piece
+// hanging-material eval term), or None if nothing attacks the square at
+// all. King is checked LAST (rather than bbGetAttackedPosition's pawn/
+// knight/king/rook/bishop order) specifically so that a real attacker
+// (pawn/knight/bishop/rook/queen) sharing the square with an attacking king
+// is never masked by the king -- important for a caller that wants to
+// treat "only a lone king attacks this" as a materially different case
+// from "a real piece attacks this, and the king happens to also be nearby".
+// Rook and queen share one combined bitboard check (as do bishop and
+// queen), same simplification bbGetAttackedPosition/bbIsSquareAttacked
+// already make -- this can't tell a queen's straight-line attack from a
+// rook's, or its diagonal attack from a bishop's, but callers that only
+// need "roughly how cheap is the cheapest attacker" don't need that
+// distinction.
+function bbSquareAttackerType(boardPos, square, byColor) {
+    const bb = syncBitboards(boardPos);
+    const oppositeOfByColor = byColor === White ? Black : White;
+
+    const pawnAtk = PAWN_ATTACKS[oppositeOfByColor][square], pawnBB = bb.piece[byColor][Pawn];
+    if ((pawnAtk.lo & pawnBB.lo) !== 0 || (pawnAtk.hi & pawnBB.hi) !== 0) return Pawn;
+
+    const knightAtk = KNIGHT_ATTACKS[square], knightBB = bb.piece[byColor][Knight];
+    if ((knightAtk.lo & knightBB.lo) !== 0 || (knightAtk.hi & knightBB.hi) !== 0) return Knight;
+
+    const queen = bb.piece[byColor][Queen];
+    const bishop = bb.piece[byColor][Bishop];
+    const bishopQueenLo = bishop.lo | queen.lo, bishopQueenHi = bishop.hi | queen.hi;
+    const bishopAtk = bishopAttacks(square, bb.all);
+    if ((bishopAtk.lo & bishopQueenLo) !== 0 || (bishopAtk.hi & bishopQueenHi) !== 0) return Bishop;
+
+    const rook = bb.piece[byColor][Rook];
+    const rookQueenLo = rook.lo | queen.lo, rookQueenHi = rook.hi | queen.hi;
+    const rookAtk = rookAttacks(square, bb.all);
+    if ((rookAtk.lo & rookQueenLo) !== 0 || (rookAtk.hi & rookQueenHi) !== 0) return Rook;
+
+    const kingAtk = KING_ATTACKS[square], kingBB = bb.piece[byColor][King];
+    if ((kingAtk.lo & kingBB.lo) !== 0 || (kingAtk.hi & kingBB.hi) !== 0) return King;
+
+    return None;
+}
 
 // Is `square` attacked by any piece of `byColor` on `boardPos`? Stateless —
 // makes no assumption about how boardPos was produced, so callers that pass
@@ -566,8 +611,8 @@ function bbWouldBeAttackedAfterMove(boardPos, move, kingSquare, byColor) {
     } else {
         // Normal move or promotion (posTo may or may not be a capture).
         const captured = boardPos[move.posTo];
-        if (captured.type !== None) {
-            capturedType = captured.type;
+        if (((captured) & 7) !== None) {
+            capturedType = ((captured) & 7);
             capturedSq = move.posTo;
             // `all` at posTo was occupied (captured piece) and stays
             // occupied (mover arrives) -- no net change, skip the toggle.

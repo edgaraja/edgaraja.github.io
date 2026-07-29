@@ -70,14 +70,28 @@ class Move {
         this.moveScoreGuess = 0;
     }
 }
-class Piece {
-    constructor(color, type) {
-        this.color = color;
-        this.type = type;
-        this.isMoved = false;
-    }
-}
-var lastMove = new Move(new Piece(None, None), 0, 0, 0, false, null, false, null, false, null);
+// Every board square and every Move's piece-related field (`piece`,
+// `attPiece`, `promotedTo`) is one of these packed numbers, not an object --
+// color|type|moved-bit in a single byte, read with raw bitmasks instead of
+// object property access. `None`/`Pawn`..`King` (0-6) and `White`/`Black`
+// (8/16) are unchanged from their original values and already occupy
+// disjoint bit ranges, so `color | type` was already a unique byte per
+// (color, type) combination before this existed; MOVED_BIT (32) adds the
+// one piece of per-square mutable state (castling rights) that isn't
+// encoded in color/type alone. 0 doubles as both `None` and the universal
+// "empty square" sentinel -- every emptiness check in this engine is
+// `((x) & 7) == None`, never a nullish check, so a plain `0` is a safe,
+// unambiguous empty value.
+const TYPE_MASK = 7;    // bits 0-2: None=0..King=6
+const COLOR_MASK = 24;  // bits 3-4: White=8, Black=16
+const MOVED_BIT = 32;   // bit 5
+
+function pieceType(b) { return b & TYPE_MASK; }
+function pieceColor(b) { return b & COLOR_MASK; }
+function hasMoved(b) { return (b & MOVED_BIT) !== 0; }
+function makePiece(color, type, moved) { return color | type | (moved ? MOVED_BIT : 0); }
+
+var lastMove = new Move(((None) | (None) | ((false) ? 32 : 0)), 0, 0, 0, false, null, false, null, false, null);
 
 function createBoard() {
     var board = document.createElement("div");
@@ -293,6 +307,14 @@ function getAttackedPosition(boardPos, color) {
     return bbGetAttackedPosition(boardPos, color);
 }
 
+// Like getAttackedPosition, but reports which piece type is the cheapest
+// attacker of just this one square (or None), via the same per-square scan
+// isSquareAttacked below uses instead of a whole-board attack map. See
+// bbSquareAttackerType's own comment for why King is checked last.
+function squareAttackerType(boardPos, square, byColor) {
+    return bbSquareAttackerType(boardPos, square, byColor);
+}
+
 // Like getAttackedPosition, but answers "is this one square attacked by
 // byColor?" by scanning outward from `square` and stopping at the first
 // piece found in each direction, instead of building an attack map for
@@ -336,7 +358,7 @@ function computePinnedPieces(boardPos, kingPos, kingColor) {
 function isMoveValidForCastle(move, WKPos, BKPos, Bpos) {
     let kingPos;
     let color;
-    if (move.piece.color == White) {
+    if (((move.piece) & 24) == White) {
         kingPos = WKPos;
         color = Black;
     } else {
@@ -361,7 +383,7 @@ function isMoveValid(move, WKPos, BKPos, Bpos) {
     // rescanning the board entirely. King moves, en passant (its rare
     // discovered-check-via-double-pawn-removal case), and pinned pieces
     // still need the full check below.
-    if (!currentKingInCheck && move.piece.type !== King && !move.isEnp && currentPinnedMap) {
+    if (!currentKingInCheck && ((move.piece) & 7) !== King && !move.isEnp && currentPinnedMap) {
         const allowed = currentPinnedMap.get(move.pos);
         if (!allowed) return true;
         return allowed.has(move.posTo);
@@ -373,12 +395,12 @@ function isMoveValid(move, WKPos, BKPos, Bpos) {
     // clone, no full bitboard rebuild. See bbWouldBeAttackedAfterMove.
     let color;
     let kingPos;
-    if (move.piece.color == White) {
+    if (((move.piece) & 24) == White) {
         color = Black;
-        kingPos = move.piece.type == King ? move.posTo : WKPos;
+        kingPos = ((move.piece) & 7) == King ? move.posTo : WKPos;
     } else {
         color = White;
-        kingPos = move.piece.type == King ? move.posTo : BKPos;
+        kingPos = ((move.piece) & 7) == King ? move.posTo : BKPos;
     }
     return !bbWouldBeAttackedAfterMove(Bpos, move, kingPos, color);
 }
@@ -393,26 +415,26 @@ function isChecked(kingPos, attPos) {
 function moveToBoard(move, boardPos) {
     let newBoardPos = boardPos.slice();
     if (!move.isCastle && !move.isPromoted && !move.isEnp) {
-        newBoardPos[move.pos] = new Piece(None, None);
+        newBoardPos[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
         newBoardPos[move.posTo] = move.piece;
     } else if (move.isEnp) {
-        newBoardPos[move.pos] = new Piece(None, None);
+        newBoardPos[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
         newBoardPos[move.posTo] = move.piece;
-        newBoardPos[move.enpTo] = new Piece(None, None);
+        newBoardPos[move.enpTo] = ((None) | (None) | ((false) ? 32 : 0));
     } else if (move.isCastle) {
         if (move.castleType == "l") {
-            newBoardPos[move.pos] = new Piece(None, None);
+            newBoardPos[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
             newBoardPos[move.posTo] = move.piece;
             newBoardPos[move.posTo + 1] = newBoardPos[move.posTo - 2];
-            newBoardPos[move.posTo - 2] = new Piece(None, None);
+            newBoardPos[move.posTo - 2] = ((None) | (None) | ((false) ? 32 : 0));
         } else if (move.castleType == "s") {
-            newBoardPos[move.pos] = new Piece(None, None);
+            newBoardPos[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
             newBoardPos[move.posTo] = move.piece;
             newBoardPos[move.posTo - 1] = newBoardPos[move.posTo + 1];
-            newBoardPos[move.posTo + 1] = new Piece(None, None);
+            newBoardPos[move.posTo + 1] = ((None) | (None) | ((false) ? 32 : 0));
         }
     } else if (move.isPromoted == true) {
-        newBoardPos[move.pos] = new Piece(None, None);
+        newBoardPos[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
         newBoardPos[move.posTo] = move.promotedTo;
     }
 
@@ -420,12 +442,9 @@ function moveToBoard(move, boardPos) {
 }
 
 // Shared placeholder for "this square is empty," reused everywhere makeMove
-// vacates a square instead of allocating a fresh `new Piece(None, None)` per
-// move. Safe because nothing anywhere reads identity off an empty square's
-// Piece (only .type/.color, always via equality) or mutates one in place
-// (the codebase-wide invariant that a Piece's fields are never reassigned
-// after construction -- see makeMove's own doc comment below).
-const EMPTY_PIECE = new Piece(None, None);
+// vacates a square instead of recomputing it per move. `((None) | (// None) | ((false) ? 32 : 0))` reduces to plain `0`, same as `None` itself -- kept as a
+// named alias purely for readability at vacate-a-square call sites.
+const EMPTY_PIECE = ((None) | (None) | ((false) ? 32 : 0));
 
 // A move is applied and unmade at most a few dozen plies deep in this
 // engine's search (iterative deepening runs to depth 40, check extensions
@@ -483,16 +502,14 @@ function colorOccupancyBB(liveBB, color) {
 // need to undo anything.
 //
 // The undo record always snapshots board[sq] DIRECTLY (never move.piece /
-// move.attPiece) before writing anything, because neither field is a
+// move.attPiece) before writing anything, because move.piece isn't a
 // trustworthy record of "what was actually on this square before the move"
 // for every move type: getKingMoves/getRookMoves (and their getcapture.js
-// capture-only mirrors) reassign `piece` to a brand-new Piece with
-// isMoved=true up front, before generating any of that piece's moves
-// (including castling), so move.piece for a king/rook move never reflects
-// the square's true prior isMoved value; and every promotion branch builds
-// its 4 underpromotion variants via structuredClone(move), which deep-clones
-// move.piece/move.attPiece and breaks reference identity entirely. Reading
-// the board directly sidesteps both traps uniformly, for every move type.
+// capture-only mirrors) set the piece's moved-bit up front, before
+// generating any of that piece's moves (including castling), so move.piece
+// for a king/rook move already reflects the moved-bit's value AFTER the
+// move, not the square's true prior state. Reading the board directly
+// sidesteps that uniformly, for every move type.
 //
 // Mirrors moveToBoard's four branches exactly, so behavior stays identical
 // to the clone-based path -- including the same castling quirk moveToBoard
@@ -510,15 +527,15 @@ function makeMove(move, board) {
         board[move.pos] = EMPTY_PIECE;
         board[move.posTo] = move.piece;
 
-        const moverPieceBB = bb.piece[move.piece.color][move.piece.type];
-        const moverColorBB = colorOccupancyBB(bb, move.piece.color);
+        const moverPieceBB = bb.piece[((move.piece) & 24)][((move.piece) & 7)];
+        const moverColorBB = colorOccupancyBB(bb, ((move.piece) & 24));
         touchBB(undo, moverPieceBB, move.pos);
         touchBB(undo, moverColorBB, move.pos);
         touchBB(undo, bb.all, move.pos);
         const captured = undo.pieces[1];
-        if (captured.type !== None) {
-            touchBB(undo, bb.piece[captured.color][captured.type], move.posTo);
-            touchBB(undo, colorOccupancyBB(bb, captured.color), move.posTo);
+        if (((captured) & 7) !== None) {
+            touchBB(undo, bb.piece[((captured) & 24)][((captured) & 7)], move.posTo);
+            touchBB(undo, colorOccupancyBB(bb, ((captured) & 24)), move.posTo);
             touchBB(undo, bb.all, move.posTo);
         }
         touchBB(undo, moverPieceBB, move.posTo);
@@ -533,14 +550,14 @@ function makeMove(move, board) {
         board[move.posTo] = move.piece;
         board[move.enpTo] = EMPTY_PIECE;
 
-        const moverPieceBB = bb.piece[move.piece.color][move.piece.type];
-        const moverColorBB = colorOccupancyBB(bb, move.piece.color);
+        const moverPieceBB = bb.piece[((move.piece) & 24)][((move.piece) & 7)];
+        const moverColorBB = colorOccupancyBB(bb, ((move.piece) & 24));
         touchBB(undo, moverPieceBB, move.pos);
         touchBB(undo, moverColorBB, move.pos);
         touchBB(undo, bb.all, move.pos);
         const captured = undo.pieces[2];
-        touchBB(undo, bb.piece[captured.color][captured.type], move.enpTo);
-        touchBB(undo, colorOccupancyBB(bb, captured.color), move.enpTo);
+        touchBB(undo, bb.piece[((captured) & 24)][((captured) & 7)], move.enpTo);
+        touchBB(undo, colorOccupancyBB(bb, ((captured) & 24)), move.enpTo);
         touchBB(undo, bb.all, move.enpTo);
         touchBB(undo, moverPieceBB, move.posTo);
         touchBB(undo, moverColorBB, move.posTo);
@@ -558,8 +575,8 @@ function makeMove(move, board) {
         board[rookTo] = board[rookFrom];
         board[rookFrom] = EMPTY_PIECE;
 
-        const colorBB = colorOccupancyBB(bb, move.piece.color);
-        const kingPieceBB = bb.piece[move.piece.color][move.piece.type];
+        const colorBB = colorOccupancyBB(bb, ((move.piece) & 24));
+        const kingPieceBB = bb.piece[((move.piece) & 24)][((move.piece) & 7)];
         touchBB(undo, kingPieceBB, move.pos);
         touchBB(undo, colorBB, move.pos);
         touchBB(undo, bb.all, move.pos);
@@ -567,7 +584,7 @@ function makeMove(move, board) {
         touchBB(undo, colorBB, move.posTo);
         touchBB(undo, bb.all, move.posTo);
         const rookPiece = undo.pieces[2];
-        const rookPieceBB = bb.piece[rookPiece.color][rookPiece.type];
+        const rookPieceBB = bb.piece[((rookPiece) & 24)][((rookPiece) & 7)];
         touchBB(undo, rookPieceBB, rookFrom);
         touchBB(undo, colorBB, rookFrom);
         touchBB(undo, bb.all, rookFrom);
@@ -581,17 +598,17 @@ function makeMove(move, board) {
         board[move.pos] = EMPTY_PIECE;
         board[move.posTo] = move.promotedTo;
 
-        const moverColorBB = colorOccupancyBB(bb, move.piece.color);
-        touchBB(undo, bb.piece[move.piece.color][move.piece.type], move.pos);
+        const moverColorBB = colorOccupancyBB(bb, ((move.piece) & 24));
+        touchBB(undo, bb.piece[((move.piece) & 24)][((move.piece) & 7)], move.pos);
         touchBB(undo, moverColorBB, move.pos);
         touchBB(undo, bb.all, move.pos);
         const captured = undo.pieces[1];
-        if (captured.type !== None) {
-            touchBB(undo, bb.piece[captured.color][captured.type], move.posTo);
-            touchBB(undo, colorOccupancyBB(bb, captured.color), move.posTo);
+        if (((captured) & 7) !== None) {
+            touchBB(undo, bb.piece[((captured) & 24)][((captured) & 7)], move.posTo);
+            touchBB(undo, colorOccupancyBB(bb, ((captured) & 24)), move.posTo);
             touchBB(undo, bb.all, move.posTo);
         }
-        touchBB(undo, bb.piece[move.promotedTo.color][move.promotedTo.type], move.posTo);
+        touchBB(undo, bb.piece[((move.promotedTo) & 24)][((move.promotedTo) & 7)], move.posTo);
         touchBB(undo, moverColorBB, move.posTo);
         touchBB(undo, bb.all, move.posTo);
     }
@@ -617,23 +634,7 @@ function unmakeMove(undo, board) {
 }
 
 function fileAt(pos) {
-    if (pos >= 0 && pos <= 7) {
-        return 1;
-    } else if (pos >= 8 && pos <= 15) {
-        return 2;
-    } else if (pos >= 16 && pos <= 23) {
-        return 3;
-    } else if (pos >= 24 && pos <= 31) {
-        return 4;
-    } else if (pos >= 32 && pos <= 39) {
-        return 5;
-    } else if (pos >= 40 && pos <= 47) {
-        return 6;
-    } else if (pos >= 48 && pos <= 55) {
-        return 7;
-    } else if (pos >= 56 && pos <= 63) {
-        return 8;
-    }
+    return Math.floor(pos / 8) + 1;
 }
 
 function rankAt(pos) {
@@ -661,37 +662,37 @@ function showPiece(boardPos) {
         pos.classList.remove("BlackPawn");
         pos.removeAttribute("color");
         pos.removeAttribute("type");
-        if (boardPos[i].color == White) {
-            if (boardPos[i].type == King) {
+        if (((boardPos[i]) & 24) == White) {
+            if (((boardPos[i]) & 7) == King) {
                 pos.classList.add("WhiteKing");
-            } else if (boardPos[i].type == Queen) {
+            } else if (((boardPos[i]) & 7) == Queen) {
                 pos.classList.add("WhiteQueen");
-            } else if (boardPos[i].type == Rook) {
+            } else if (((boardPos[i]) & 7) == Rook) {
                 pos.classList.add("WhiteRook");
-            } else if (boardPos[i].type == Knight) {
+            } else if (((boardPos[i]) & 7) == Knight) {
                 pos.classList.add("WhiteKnight");
-            } else if (boardPos[i].type == Bishop) {
+            } else if (((boardPos[i]) & 7) == Bishop) {
                 pos.classList.add("WhiteBishop");
-            } else if (boardPos[i].type == Pawn) {
+            } else if (((boardPos[i]) & 7) == Pawn) {
                 pos.classList.add("WhitePawn");
             }
-        } else if (boardPos[i].color == Black) {
-            if (boardPos[i].type == King) {
+        } else if (((boardPos[i]) & 24) == Black) {
+            if (((boardPos[i]) & 7) == King) {
                 pos.classList.add("BlackKing");
-            } else if (boardPos[i].type == Queen) {
+            } else if (((boardPos[i]) & 7) == Queen) {
                 pos.classList.add("BlackQueen");
-            } else if (boardPos[i].type == Rook) {
+            } else if (((boardPos[i]) & 7) == Rook) {
                 pos.classList.add("BlackRook");
-            } else if (boardPos[i].type == Knight) {
+            } else if (((boardPos[i]) & 7) == Knight) {
                 pos.classList.add("BlackKnight");
-            } else if (boardPos[i].type == Bishop) {
+            } else if (((boardPos[i]) & 7) == Bishop) {
                 pos.classList.add("BlackBishop");
-            } else if (boardPos[i].type == Pawn) {
+            } else if (((boardPos[i]) & 7) == Pawn) {
                 pos.classList.add("BlackPawn");
             }
         }
-        pos.setAttribute("color", boardPos[i].color);
-        pos.setAttribute("type", boardPos[i].type);
+        pos.setAttribute("color", ((boardPos[i]) & 24));
+        pos.setAttribute("type", ((boardPos[i]) & 7));
     }
 }
 
@@ -707,53 +708,53 @@ function generatePieces(FEN) {
     for (i = 0; i < FEN.length; i++) {
         if (flag == 0) {
             if (FEN[i] == "K") {
-                boardPosition[pos] = new Piece(White, King);
+                boardPosition[pos] = ((White) | (King) | ((false) ? 32 : 0));
                 WhiteKingPos = pos;
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "Q") {
-                boardPosition[pos] = new Piece(White, Queen);
+                boardPosition[pos] = ((White) | (Queen) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "R") {
-                boardPosition[pos] = new Piece(White, Rook);
+                boardPosition[pos] = ((White) | (Rook) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "N") {
-                boardPosition[pos] = new Piece(White, Knight);
+                boardPosition[pos] = ((White) | (Knight) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "B") {
-                boardPosition[pos] = new Piece(White, Bishop);
+                boardPosition[pos] = ((White) | (Bishop) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "P") {
-                boardPosition[pos] = new Piece(White, Pawn);
+                boardPosition[pos] = ((White) | (Pawn) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "k") {
-                boardPosition[pos] = new Piece(Black, King);
+                boardPosition[pos] = ((Black) | (King) | ((false) ? 32 : 0));
                 BlackKingPos = pos;
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "q") {
-                boardPosition[pos] = new Piece(Black, Queen);
+                boardPosition[pos] = ((Black) | (Queen) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "r") {
-                boardPosition[pos] = new Piece(Black, Rook);
+                boardPosition[pos] = ((Black) | (Rook) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "n") {
-                boardPosition[pos] = new Piece(Black, Knight);
+                boardPosition[pos] = ((Black) | (Knight) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "b") {
-                boardPosition[pos] = new Piece(Black, Bishop);
+                boardPosition[pos] = ((Black) | (Bishop) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "p") {
-                boardPosition[pos] = new Piece(Black, Pawn);
+                boardPosition[pos] = ((Black) | (Pawn) | ((false) ? 32 : 0));
                 pos++;
                 pieceCount++;
             } else if (FEN[i] == "/") {
@@ -777,19 +778,19 @@ function generatePieces(FEN) {
 
 function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, lm) {
     let moveList = [];
-    if (piece.color == White && color == White) {
+    if (((piece) & 24) == White && color == White) {
         if (pos >= 8 && pos <= 15) {
-            if (boardPos[pos + 8].type == None) {
+            if (((boardPos[pos + 8]) & 7) == None) {
                 let move = new Move(piece, pos, pos + 8, boardPos[pos + 8], false, null, false, null, false, null);
                 if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) moveList.push(move);
-                if (boardPos[pos + 16].type == None) {
+                if (((boardPos[pos + 16]) & 7) == None) {
                     let move = new Move(piece, pos, pos + 16, boardPos[pos + 16], false, null, false, null, false, null);
                     if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) moveList.push(move);
                 }
             }
         } else {
             if (pos + 8 <= 63) {
-                if (boardPos[pos + 8].type == None) {
+                if (((boardPos[pos + 8]) & 7) == None) {
                     let move = new Move(piece, pos, pos + 8, boardPos[pos + 8], false, null, false, null, false, null);
                     let move1;
                     let move2;
@@ -798,14 +799,14 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                     if (fileAt(pos + 8) == 8) {
                         if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) {
                             move.isPromoted = true;
-                            move.promotedTo = new Piece(White, Queen);
-                            move1 = structuredClone(move);
-                            move.promotedTo = new Piece(White, Rook);
-                            move2 = structuredClone(move);
-                            move.promotedTo = new Piece(White, Knight);
-                            move3 = structuredClone(move);
-                            move.promotedTo = new Piece(White, Bishop);
-                            move4 = structuredClone(move);
+                            move.promotedTo = ((White) | (Queen) | ((false) ? 32 : 0));
+                            move1 = { ...move };
+                            move.promotedTo = ((White) | (Rook) | ((false) ? 32 : 0));
+                            move2 = { ...move };
+                            move.promotedTo = ((White) | (Knight) | ((false) ? 32 : 0));
+                            move3 = { ...move };
+                            move.promotedTo = ((White) | (Bishop) | ((false) ? 32 : 0));
+                            move4 = { ...move };
                             moveList.push(move1);
                             moveList.push(move2);
                             moveList.push(move3);
@@ -818,7 +819,7 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
             }
         }
         if (testBit64(PAWN_ATTACKS[White][pos], pos + 7)) {
-            if (boardPos[pos + 7].type != None && boardPos[pos + 7].color == Black) {
+            if (((boardPos[pos + 7]) & 7) != None && ((boardPos[pos + 7]) & 24) == Black) {
                 let move = new Move(piece, pos, pos + 7, boardPos[pos + 7], false, null, false, null, false, null);
                 let move1;
                 let move2;
@@ -827,14 +828,14 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                 if (fileAt(pos + 7) == 8) {
                     if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) {
                         move.isPromoted = true;
-                        move.promotedTo = new Piece(White, Queen);
-                        move1 = structuredClone(move);
-                        move.promotedTo = new Piece(White, Rook);
-                        move2 = structuredClone(move);
-                        move.promotedTo = new Piece(White, Knight);
-                        move3 = structuredClone(move);
-                        move.promotedTo = new Piece(White, Bishop);
-                        move4 = structuredClone(move);
+                        move.promotedTo = ((White) | (Queen) | ((false) ? 32 : 0));
+                        move1 = { ...move };
+                        move.promotedTo = ((White) | (Rook) | ((false) ? 32 : 0));
+                        move2 = { ...move };
+                        move.promotedTo = ((White) | (Knight) | ((false) ? 32 : 0));
+                        move3 = { ...move };
+                        move.promotedTo = ((White) | (Bishop) | ((false) ? 32 : 0));
+                        move4 = { ...move };
                         moveList.push(move1);
                         moveList.push(move2);
                         moveList.push(move3);
@@ -846,7 +847,7 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
             }
         }
         if (testBit64(PAWN_ATTACKS[White][pos], pos + 9)) {
-            if (boardPos[pos + 9].type != None && boardPos[pos + 9].color == Black) {
+            if (((boardPos[pos + 9]) & 7) != None && ((boardPos[pos + 9]) & 24) == Black) {
                 let move = new Move(piece, pos, pos + 9, boardPos[pos + 9], false, null, false, null, false, null);
                 let move1;
                 let move2;
@@ -855,14 +856,14 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                 if (fileAt(pos + 9) == 8) {
                     if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) {
                         move.isPromoted = true;
-                        move.promotedTo = new Piece(White, Queen);
-                        move1 = structuredClone(move);
-                        move.promotedTo = new Piece(White, Rook);
-                        move2 = structuredClone(move);
-                        move.promotedTo = new Piece(White, Knight);
-                        move3 = structuredClone(move);
-                        move.promotedTo = new Piece(White, Bishop);
-                        move4 = structuredClone(move);
+                        move.promotedTo = ((White) | (Queen) | ((false) ? 32 : 0));
+                        move1 = { ...move };
+                        move.promotedTo = ((White) | (Rook) | ((false) ? 32 : 0));
+                        move2 = { ...move };
+                        move.promotedTo = ((White) | (Knight) | ((false) ? 32 : 0));
+                        move3 = { ...move };
+                        move.promotedTo = ((White) | (Bishop) | ((false) ? 32 : 0));
+                        move4 = { ...move };
                         moveList.push(move1);
                         moveList.push(move2);
                         moveList.push(move3);
@@ -874,7 +875,7 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
             }
         }
         if (pos >= 32 && pos <= 39) {
-            if (lm.piece.color == Black && lm.piece.type == Pawn && lm.pos - lm.posTo == 16) {
+            if (((lm.piece) & 24) == Black && ((lm.piece) & 7) == Pawn && lm.pos - lm.posTo == 16) {
                 if (diff(rankAt(pos), rankAt(pos - 1)) == 1) {
                     if (lm.posTo == pos - 1) {
                         let move = new Move(piece, pos, pos + 7, boardPos[pos - 1], false, null, false, null, true, pos - 1);
@@ -889,19 +890,19 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                 }
             }
         }
-    } else if (piece.color == Black && color == Black) {
+    } else if (((piece) & 24) == Black && color == Black) {
         if (pos >= 48 && pos <= 55) {
-            if (boardPos[pos - 8].type == None) {
+            if (((boardPos[pos - 8]) & 7) == None) {
                 let move = new Move(piece, pos, pos - 8, boardPos[pos - 8], false, null, false, null, false, null);
                 if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) moveList.push(move);
-                if (boardPos[pos - 16].type == None) {
+                if (((boardPos[pos - 16]) & 7) == None) {
                     let move = new Move(piece, pos, pos - 16, boardPos[pos - 16], false, null, false, null, false, null);
                     if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) moveList.push(move);
                 }
             }
         } else {
             if (pos - 8 >= 0) {
-                if (boardPos[pos - 8].type == None) {
+                if (((boardPos[pos - 8]) & 7) == None) {
                     let move = new Move(piece, pos, pos - 8, boardPos[pos - 8], false, null, false, null, false, null);
                     let move1;
                     let move2;
@@ -910,14 +911,14 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                     if (fileAt(pos - 8) == 1) {
                         if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) {
                             move.isPromoted = true;
-                            move.promotedTo = new Piece(Black, Queen);
-                            move1 = structuredClone(move);
-                            move.promotedTo = new Piece(Black, Rook);
-                            move2 = structuredClone(move);
-                            move.promotedTo = new Piece(Black, Knight);
-                            move3 = structuredClone(move);
-                            move.promotedTo = new Piece(Black, Bishop);
-                            move4 = structuredClone(move);
+                            move.promotedTo = ((Black) | (Queen) | ((false) ? 32 : 0));
+                            move1 = { ...move };
+                            move.promotedTo = ((Black) | (Rook) | ((false) ? 32 : 0));
+                            move2 = { ...move };
+                            move.promotedTo = ((Black) | (Knight) | ((false) ? 32 : 0));
+                            move3 = { ...move };
+                            move.promotedTo = ((Black) | (Bishop) | ((false) ? 32 : 0));
+                            move4 = { ...move };
                             moveList.push(move1);
                             moveList.push(move2);
                             moveList.push(move3);
@@ -930,7 +931,7 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
             }
         }
         if (testBit64(PAWN_ATTACKS[Black][pos], pos - 7)) {
-            if (boardPos[pos - 7].type != None && boardPos[pos - 7].color == White) {
+            if (((boardPos[pos - 7]) & 7) != None && ((boardPos[pos - 7]) & 24) == White) {
                 let move = new Move(piece, pos, pos - 7, boardPos[pos - 7], false, null, false, null, false, null);
                 let move1;
                 let move2;
@@ -939,14 +940,14 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                 if (fileAt(pos - 7) == 1) {
                     if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) {
                         move.isPromoted = true;
-                        move.promotedTo = new Piece(Black, Queen);
-                        move1 = structuredClone(move);
-                        move.promotedTo = new Piece(Black, Rook);
-                        move2 = structuredClone(move);
-                        move.promotedTo = new Piece(Black, Knight);
-                        move3 = structuredClone(move);
-                        move.promotedTo = new Piece(Black, Bishop);
-                        move4 = structuredClone(move);
+                        move.promotedTo = ((Black) | (Queen) | ((false) ? 32 : 0));
+                        move1 = { ...move };
+                        move.promotedTo = ((Black) | (Rook) | ((false) ? 32 : 0));
+                        move2 = { ...move };
+                        move.promotedTo = ((Black) | (Knight) | ((false) ? 32 : 0));
+                        move3 = { ...move };
+                        move.promotedTo = ((Black) | (Bishop) | ((false) ? 32 : 0));
+                        move4 = { ...move };
                         moveList.push(move1);
                         moveList.push(move2);
                         moveList.push(move3);
@@ -958,7 +959,7 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
             }
         }
         if (testBit64(PAWN_ATTACKS[Black][pos], pos - 9)) {
-            if (boardPos[pos - 9].type != None && boardPos[pos - 9].color == White) {
+            if (((boardPos[pos - 9]) & 7) != None && ((boardPos[pos - 9]) & 24) == White) {
                 let move = new Move(piece, pos, pos - 9, boardPos[pos - 9], false, null, false, null, false, null);
                 let move1;
                 let move2;
@@ -967,14 +968,14 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
                 if (fileAt(pos - 9) == 1) {
                     if (isMoveValid(move, whiteKingPos, blackKingPos, boardPos)) {
                         move.isPromoted = true;
-                        move.promotedTo = new Piece(Black, Queen);
-                        move1 = structuredClone(move);
-                        move.promotedTo = new Piece(Black, Rook);
-                        move2 = structuredClone(move);
-                        move.promotedTo = new Piece(Black, Knight);
-                        move3 = structuredClone(move);
-                        move.promotedTo = new Piece(Black, Bishop);
-                        move4 = structuredClone(move);
+                        move.promotedTo = ((Black) | (Queen) | ((false) ? 32 : 0));
+                        move1 = { ...move };
+                        move.promotedTo = ((Black) | (Rook) | ((false) ? 32 : 0));
+                        move2 = { ...move };
+                        move.promotedTo = ((Black) | (Knight) | ((false) ? 32 : 0));
+                        move3 = { ...move };
+                        move.promotedTo = ((Black) | (Bishop) | ((false) ? 32 : 0));
+                        move4 = { ...move };
                         moveList.push(move1);
                         moveList.push(move2);
                         moveList.push(move3);
@@ -986,7 +987,7 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
             }
         }
         if (pos >= 24 && pos <= 31) {
-            if (lm.piece.color == White && lm.piece.type == Pawn && lm.pos - lm.posTo == -16) {
+            if (((lm.piece) & 24) == White && ((lm.piece) & 7) == Pawn && lm.pos - lm.posTo == -16) {
                 if (diff(rankAt(pos), rankAt(pos - 1)) == 1) {
                     if (lm.posTo == pos - 1) {
                         let move = new Move(piece, pos, pos - 9, boardPos[pos - 1], false, null, false, null, true, pos - 1);
@@ -1008,9 +1009,9 @@ function getPawnMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos, l
 function getKnightMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos) {
     let moveList = [];
 
-    if (piece.color == color) {
+    if (((piece) & 24) == color) {
         const bb = syncBitboards(boardPos);
-        const ownOcc = piece.color == White ? bb.white : bb.black;
+        const ownOcc = ((piece) & 24) == White ? bb.white : bb.black;
         const destBB = andNot64(KNIGHT_ATTACKS[pos], ownOcc);
         forEachBit(destBB, (pos1) => {
             let move = new Move(piece, pos, pos1, boardPos[pos1], false, null, false, null, false, null);
@@ -1024,9 +1025,9 @@ function getKnightMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos)
 function getBishopMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos) {
     let moveList = [];
 
-    if (piece.color == color) {
+    if (((piece) & 24) == color) {
         const bb = syncBitboards(boardPos);
-        const ownOcc = piece.color == White ? bb.white : bb.black;
+        const ownOcc = ((piece) & 24) == White ? bb.white : bb.black;
         const destBB = andNot64(bishopAttacks(pos, bb.all), ownOcc);
         forEachBit(destBB, (pos1) => {
             let move = new Move(piece, pos, pos1, boardPos[pos1], false, null, false, null, false, null);
@@ -1039,12 +1040,11 @@ function getBishopMoves(pos, piece, color, boardPos, whiteKingPos, blackKingPos)
 
 function getRookMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
-    piece = new Piece(piece.color, piece.type);
-    piece.isMoved = true;
+    piece = ((((piece) & 24)) | (((piece) & 7)) | ((true) ? 32 : 0));
 
-    if (piece.color == color) {
+    if (((piece) & 24) == color) {
         const bb = syncBitboards(boardPos);
-        const ownOcc = piece.color == White ? bb.white : bb.black;
+        const ownOcc = ((piece) & 24) == White ? bb.white : bb.black;
         const destBB = andNot64(rookAttacks(pos, bb.all), ownOcc);
         forEachBit(destBB, (pos1) => {
             let move = new Move(piece, pos, pos1, boardPos[pos1], false, null, false, null, false, null);
@@ -1058,9 +1058,9 @@ function getRookMoves(pos, piece, color, boardPos, WKPos, BKPos) {
 function getQueenMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
 
-    if (piece.color == color) {
+    if (((piece) & 24) == color) {
         const bb = syncBitboards(boardPos);
-        const ownOcc = piece.color == White ? bb.white : bb.black;
+        const ownOcc = ((piece) & 24) == White ? bb.white : bb.black;
         const destBB = andNot64(queenAttacks(pos, bb.all), ownOcc);
         forEachBit(destBB, (pos1) => {
             let move = new Move(piece, pos, pos1, boardPos[pos1], false, null, false, null, false, null);
@@ -1072,47 +1072,46 @@ function getQueenMoves(pos, piece, color, boardPos, WKPos, BKPos) {
 
 function getKingMoves(pos, piece, color, boardPos, WKPos, BKPos) {
     let moveList = [];
-    piece = new Piece(piece.color, piece.type);
-    piece.isMoved = true;
-    if (piece.color == color) {
+    piece = ((((piece) & 24)) | (((piece) & 7)) | ((true) ? 32 : 0));
+    if (((piece) & 24) == color) {
         const bb = syncBitboards(boardPos);
-        const ownOcc = piece.color == White ? bb.white : bb.black;
+        const ownOcc = ((piece) & 24) == White ? bb.white : bb.black;
         const destBB = andNot64(KING_ATTACKS[pos], ownOcc);
         forEachBit(destBB, (pos1) => {
             let move = new Move(piece, pos, pos1, boardPos[pos1], false, null, false, null, false, null);
             if (isMoveValid(move, WKPos, BKPos, boardPos)) moveList.push(move);
         });
-        if (pos == 4 && piece.color == White) {
-            if (boardPos[0].type == Rook && boardPos[0].color == White) {
-                if (boardPos[1].type == None && boardPos[2].type == None && boardPos[3].type == None) {
-                    if (!boardPos[0].isMoved && !boardPos[pos].isMoved) {
-                        let move = new Move(piece, pos, 2, new Piece(None, None), true, "l", false, null, false, null);
+        if (pos == 4 && ((piece) & 24) == White) {
+            if (((boardPos[0]) & 7) == Rook && ((boardPos[0]) & 24) == White) {
+                if (((boardPos[1]) & 7) == None && ((boardPos[2]) & 7) == None && ((boardPos[3]) & 7) == None) {
+                    if (!(((boardPos[0]) & 32) !== 0) && !(((boardPos[pos]) & 32) !== 0)) {
+                        let move = new Move(piece, pos, 2, ((None) | (None) | ((false) ? 32 : 0)), true, "l", false, null, false, null);
                         if (isMoveValidForCastle(move, WKPos, BKPos, boardPos)) moveList.push(move);
                     }
                 }
             }
-            if (boardPos[7].type == Rook && boardPos[7].color == White) {
-                if (boardPos[5].type == None && boardPos[6].type == None) {
-                    if (!boardPos[7].isMoved && !boardPos[pos].isMoved) {
-                        let move = new Move(piece, pos, 6, new Piece(None, None), true, "s", false, null, false, null);
+            if (((boardPos[7]) & 7) == Rook && ((boardPos[7]) & 24) == White) {
+                if (((boardPos[5]) & 7) == None && ((boardPos[6]) & 7) == None) {
+                    if (!(((boardPos[7]) & 32) !== 0) && !(((boardPos[pos]) & 32) !== 0)) {
+                        let move = new Move(piece, pos, 6, ((None) | (None) | ((false) ? 32 : 0)), true, "s", false, null, false, null);
                         if (isMoveValidForCastle(move, WKPos, BKPos, boardPos)) moveList.push(move);
                     }
                 }
             }
         }
-        if (pos == 60 && piece.color == Black) {
-            if (boardPos[56].type == Rook && boardPos[56].color == Black) {
-                if (boardPos[57].type == None && boardPos[58].type == None && boardPos[59].type == None) {
-                    if (!boardPos[56].isMoved && !boardPos[pos].isMoved) {
-                        let move = new Move(piece, pos, 58, new Piece(None, None), true, "l", false, null, false, null);
+        if (pos == 60 && ((piece) & 24) == Black) {
+            if (((boardPos[56]) & 7) == Rook && ((boardPos[56]) & 24) == Black) {
+                if (((boardPos[57]) & 7) == None && ((boardPos[58]) & 7) == None && ((boardPos[59]) & 7) == None) {
+                    if (!(((boardPos[56]) & 32) !== 0) && !(((boardPos[pos]) & 32) !== 0)) {
+                        let move = new Move(piece, pos, 58, ((None) | (None) | ((false) ? 32 : 0)), true, "l", false, null, false, null);
                         if (isMoveValidForCastle(move, WKPos, BKPos, boardPos)) moveList.push(move);
                     }
                 }
             }
-            if (boardPos[63].type == Rook && boardPos[63].color == Black) {
-                if (boardPos[61].type == None && boardPos[62].type == None) {
-                    if (!boardPos[63].isMoved && !boardPos[pos].isMoved) {
-                        let move = new Move(piece, pos, 62, new Piece(None, None), true, "s", false, null, false, null);
+            if (((boardPos[63]) & 7) == Rook && ((boardPos[63]) & 24) == Black) {
+                if (((boardPos[61]) & 7) == None && ((boardPos[62]) & 7) == None) {
+                    if (!(((boardPos[63]) & 32) !== 0) && !(((boardPos[pos]) & 32) !== 0)) {
+                        let move = new Move(piece, pos, 62, ((None) | (None) | ((false) ? 32 : 0)), true, "s", false, null, false, null);
                         if (isMoveValidForCastle(move, WKPos, BKPos, boardPos)) moveList.push(move);
                     }
                 }
@@ -1137,17 +1136,17 @@ function getMoves(pos, piece) {
     currentPinnedMap = currentKingInCheck ? null : computePinnedPieces(boardPosition, ownKingPos, color);
 
     let moveList = [];
-    if (piece.type == Pawn) {
+    if (((piece) & 7) == Pawn) {
         moveList = moveList.concat(getPawnMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos, lastMove));
-    } else if (piece.type == Bishop) {
+    } else if (((piece) & 7) == Bishop) {
         moveList = moveList.concat(getBishopMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos));
-    } else if (piece.type == Rook) {
+    } else if (((piece) & 7) == Rook) {
         moveList = moveList.concat(getRookMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos));
-    } else if (piece.type == Queen) {
+    } else if (((piece) & 7) == Queen) {
         moveList = moveList.concat(getQueenMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos));
-    } else if (piece.type == King) {
+    } else if (((piece) & 7) == King) {
         moveList = moveList.concat(getKingMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos));
-    } else if (piece.type == Knight) {
+    } else if (((piece) & 7) == Knight) {
         moveList = moveList.concat(getKnightMoves(pos, piece, color, boardPosition, WhiteKingPos, BlackKingPos));
     }
     return moveList;
@@ -1211,10 +1210,10 @@ function checkInsufficientMaterial() {
     var whitePieces = [];
     var blackPieces = [];
     for (var i = 0; i < 64; i++) {
-        if (boardPosition[i].color == White && boardPosition[i].type != None) {
-            whitePieces.push({ type: boardPosition[i].type, sq: i });
-        } else if (boardPosition[i].color == Black && boardPosition[i].type != None) {
-            blackPieces.push({ type: boardPosition[i].type, sq: i });
+        if (((boardPosition[i]) & 24) == White && ((boardPosition[i]) & 7) != None) {
+            whitePieces.push({ type: ((boardPosition[i]) & 7), sq: i });
+        } else if (((boardPosition[i]) & 24) == Black && ((boardPosition[i]) & 7) != None) {
+            blackPieces.push({ type: ((boardPosition[i]) & 7), sq: i });
         }
     }
     // K vs K
@@ -1257,9 +1256,9 @@ function requestAiMove() {
     const color = whiteToMove ? Black : White;
     const rootMoves = sortMoves(
         getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
-        getAttackedPosition(boardPosition, color),
-        null,
-        boardPosition
+        boardPosition,
+        color,
+        null
     );
 
     const workerCount = aiWorkerPool.length;
@@ -1335,29 +1334,29 @@ async function movePiece(move) {
     if (gameOver) return;
     invalidateBitboardCache(boardPosition);
     if (!move.isCastle && !move.isPromoted && !move.isEnp) {
-        boardPosition[move.pos] = new Piece(None, None);
+        boardPosition[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
         boardPosition[move.posTo] = move.piece;
     } else if (move.isEnp) {
-        boardPosition[move.pos] = new Piece(None, None);
+        boardPosition[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
         boardPosition[move.posTo] = move.piece;
-        boardPosition[move.enpTo] = new Piece(None, None);
+        boardPosition[move.enpTo] = ((None) | (None) | ((false) ? 32 : 0));
     } else if (move.isCastle) {
         if (move.castleType == "l") {
-            boardPosition[move.pos] = new Piece(None, None);
+            boardPosition[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
             boardPosition[move.posTo] = move.piece;
             boardPosition[move.posTo + 1] = boardPosition[move.posTo - 2];
-            boardPosition[move.posTo - 2] = new Piece(None, None);
+            boardPosition[move.posTo - 2] = ((None) | (None) | ((false) ? 32 : 0));
         } else if (move.castleType == "s") {
-            boardPosition[move.pos] = new Piece(None, None);
+            boardPosition[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
             boardPosition[move.posTo] = move.piece;
             boardPosition[move.posTo - 1] = boardPosition[move.posTo + 1];
-            boardPosition[move.posTo + 1] = new Piece(None, None);
+            boardPosition[move.posTo + 1] = ((None) | (None) | ((false) ? 32 : 0));
         }
     } else if (move.isPromoted == true) {
-        boardPosition[move.pos] = new Piece(None, None);
+        boardPosition[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
         boardPosition[move.posTo] = move.promotedTo;
     }
-    if (move.attPiece.type != None) {
+    if (((move.attPiece) & 7) != None) {
         pieceCount--;
     }
     if (whiteToMove) {
@@ -1366,8 +1365,8 @@ async function movePiece(move) {
         whiteToMove = true;
     }
     lastMove = move;
-    if (move.piece.type == King) {
-        if (move.piece.color == Black) {
+    if (((move.piece) & 7) == King) {
+        if (((move.piece) & 24) == Black) {
             BlackKingPos = move.posTo;
         } else {
             WhiteKingPos = move.posTo;
@@ -1391,7 +1390,7 @@ async function movePiece(move) {
     await sleep(10);
 
     // Half-move clock: reset on any pawn move or capture, else increment
-    if (move.piece.type === Pawn || move.attPiece.type !== None || move.isEnp) {
+    if (((move.piece) & 7) === Pawn || ((move.attPiece) & 7) !== None || move.isEnp) {
         halfMoveClock = 0;
     } else {
         halfMoveClock++;
@@ -1457,7 +1456,7 @@ function showedMoveClicked(e) {
                 btnQueen.style.height = "75px";
                 btnQueen.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(White, Queen);
+                        move.promotedTo = ((White) | (Queen) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1467,7 +1466,7 @@ function showedMoveClicked(e) {
                 btnKnight.style.height = "75px";
                 btnKnight.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(White, Knight);
+                        move.promotedTo = ((White) | (Knight) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1477,7 +1476,7 @@ function showedMoveClicked(e) {
                 btnBishop.style.height = "75px";
                 btnBishop.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(White, Bishop);
+                        move.promotedTo = ((White) | (Bishop) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1487,7 +1486,7 @@ function showedMoveClicked(e) {
                 btnRook.style.height = "75px";
                 btnRook.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(White, Rook);
+                        move.promotedTo = ((White) | (Rook) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1532,7 +1531,7 @@ function showedMoveClicked(e) {
                 btnQueen.style.height = "75px";
                 btnQueen.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(Black, Queen);
+                        move.promotedTo = ((Black) | (Queen) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1542,7 +1541,7 @@ function showedMoveClicked(e) {
                 btnKnight.style.height = "75px";
                 btnKnight.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(Black, Knight);
+                        move.promotedTo = ((Black) | (Knight) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1552,7 +1551,7 @@ function showedMoveClicked(e) {
                 btnBishop.style.height = "75px";
                 btnBishop.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(Black, Bishop);
+                        move.promotedTo = ((Black) | (Bishop) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1562,7 +1561,7 @@ function showedMoveClicked(e) {
                 btnRook.style.height = "75px";
                 btnRook.addEventListener("mousedown", function (e) {
                     if (e.button == 0) {
-                        move.promotedTo = new Piece(Black, Rook);
+                        move.promotedTo = ((Black) | (Rook) | ((false) ? 32 : 0));
                         movePiece(move);
                     }
                 });
@@ -1611,7 +1610,7 @@ function showMoveList(moveList) {
         let pos = document.getElementById(move.posTo);
         if (move.isEnp) {
             pos.classList.add("moveList");
-        } else if (move.attPiece.type == None) {
+        } else if (((move.attPiece) & 7) == None) {
             pos.classList.add("moveList");
         } else {
             pos.classList.add("moveListCapture");
@@ -1645,7 +1644,7 @@ function showMove() {
                         pcs.classList.add("clicked");
                         let pieceType = pcs.getAttribute("type") - "0";
                         let pieceColor = pcs.getAttribute("color") - "0";
-                        let piece = new Piece(pieceColor, pieceType);
+                        let piece = ((pieceColor) | (pieceType) | ((false) ? 32 : 0));
                         moveList = getMoves(i, piece);
                         nextMoves = moveList;
                         showMoveList(moveList);
@@ -1675,25 +1674,25 @@ function getAllMoves(WTM, boardPos, lm, WKPos, BKPos) {
 
     // Only the side to move's own pieces can generate a move -- skip
     // opponent pieces before ever calling a generator (each generator only
-    // checks piece.color === color internally anyway, so calling it for an
-    // enemy piece was a wasted call + array allocation every time). Push
+    // checks ((piece) & 24) === color internally anyway, so calling it
+    // for an enemy piece was a wasted call + array allocation every time). Push
     // into one array instead of `moveList.concat(...)`, which reassigned
     // and copied the whole accumulated list on every single piece.
     for (let sq = 0; sq < 64; sq++) {
         const piece = boardPos[sq];
-        if (piece.color !== color) continue;
+        if (((piece) & 24) !== color) continue;
         let pieceMoves;
-        if (piece.type == Pawn) {
+        if (((piece) & 7) == Pawn) {
             pieceMoves = getPawnMoves(sq, piece, color, boardPos, WKPos, BKPos, lm);
-        } else if (piece.type == King) {
+        } else if (((piece) & 7) == King) {
             pieceMoves = getKingMoves(sq, piece, color, boardPos, WKPos, BKPos);
-        } else if (piece.type == Queen) {
+        } else if (((piece) & 7) == Queen) {
             pieceMoves = getQueenMoves(sq, piece, color, boardPos, WKPos, BKPos);
-        } else if (piece.type == Rook) {
+        } else if (((piece) & 7) == Rook) {
             pieceMoves = getRookMoves(sq, piece, color, boardPos, WKPos, BKPos);
-        } else if (piece.type == Knight) {
+        } else if (((piece) & 7) == Knight) {
             pieceMoves = getKnightMoves(sq, piece, color, boardPos, WKPos, BKPos);
-        } else if (piece.type == Bishop) {
+        } else if (((piece) & 7) == Bishop) {
             pieceMoves = getBishopMoves(sq, piece, color, boardPos, WKPos, BKPos);
         } else {
             continue;
@@ -1708,49 +1707,49 @@ function getEval() {
     let evalWhite = 0;
     let evalBlack = 0;
     for (let i = 0; i < 64; i++) {
-        if (boardPosition[i].color == Black) {
-            if (boardPosition[i].type == King) {
+        if (((boardPosition[i]) & 24) == Black) {
+            if (((boardPosition[i]) & 7) == King) {
                 if (pieceCount >= 6) {
                     evalBlack += kingMapMiddle[i] / 10;
                 } else {
                     evalBlack += kingMapEnd[i] / 10;
                 }
-            } else if (boardPosition[i].type == Queen) {
+            } else if (((boardPosition[i]) & 7) == Queen) {
                 evalBlack += 900;
                 evalBlack += queenMap[i] / 10;
-            } else if (boardPosition[i].type == Rook) {
+            } else if (((boardPosition[i]) & 7) == Rook) {
                 evalBlack += 500;
                 evalBlack += rookMap[i] / 10;
-            } else if (boardPosition[i].type == Knight) {
+            } else if (((boardPosition[i]) & 7) == Knight) {
                 evalBlack += 300;
                 evalBlack += knightMap[i] / 10;
-            } else if (boardPosition[i].type == Bishop) {
+            } else if (((boardPosition[i]) & 7) == Bishop) {
                 evalBlack += 300;
                 evalBlack += bishopMap[i] / 10;
-            } else if (boardPosition[i].type == Pawn) {
+            } else if (((boardPosition[i]) & 7) == Pawn) {
                 evalBlack += 100;
                 evalBlack += pawnMap[i] / 10;
             }
         } else {
-            if (boardPosition[i].type == King) {
+            if (((boardPosition[i]) & 7) == King) {
                 if (pieceCount >= 6) {
                     evalWhite += kingMapMiddle[i] / 10;
                 } else {
                     evalWhite += kingMapEnd[i] / 10;
                 }
-            } else if (boardPosition[i].type == Queen) {
+            } else if (((boardPosition[i]) & 7) == Queen) {
                 evalWhite += 900;
                 evalWhite += queenMap[i] / 10;
-            } else if (boardPosition[i].type == Rook) {
+            } else if (((boardPosition[i]) & 7) == Rook) {
                 evalWhite += 500;
                 evalWhite += rookMap[i] / 10;
-            } else if (boardPosition[i].type == Knight) {
+            } else if (((boardPosition[i]) & 7) == Knight) {
                 evalWhite += 300;
                 evalWhite += knightMap[i] / 10;
-            } else if (boardPosition[i].type == Bishop) {
+            } else if (((boardPosition[i]) & 7) == Bishop) {
                 evalWhite += 300;
                 evalWhite += bishopMap[i] / 10;
-            } else if (boardPosition[i].type == Pawn) {
+            } else if (((boardPosition[i]) & 7) == Pawn) {
                 evalWhite += 100;
                 evalWhite += pawnMap[i] / 10;
             }
@@ -1782,8 +1781,13 @@ async function playAsBlack() {
 // before generatePieces() runs. Previously this sizing happened as a side
 // effect of createBoard()'s DOM tile-creation loop; a Worker never calls
 // createBoard(), so it's hoisted out here instead.
+//
+// boardPosition is a Uint8Array, not a plain Array -- each square is a
+// packed piece byte (see makePiece/pieceType/pieceColor/hasMoved above),
+// and a zero-filled Uint8Array(64) is already "all empty" (None === 0)
+// with no per-square construction needed.
+boardPosition = new Uint8Array(64);
 for (let i = 0; i < 64; i++) {
-    boardPosition.push(new Piece(None, None));
     attackedPosition.push(None);
 }
 generatePieces(defaultFEN);

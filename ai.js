@@ -24,8 +24,8 @@ function test2(depth, WTM, boardPos, lm, WKPos, BKPos) {
         let newBoardPos = moveToBoard(moveList[i], boardPos);
         lm = moveList[i];
         let num;
-        if (moveList[i].piece.type == King) {
-            if (moveList[i].piece.color == Black) {
+        if (((moveList[i].piece) & 7) == King) {
+            if (((moveList[i].piece) & 24) == Black) {
                 num = test2(depth - 1, WTM, newBoardPos, lm, WKPos, moveList[i].posTo);
             } else {
                 num = test2(depth - 1, WTM, newBoardPos, lm, moveList[i].posTo, BKPos);
@@ -98,8 +98,8 @@ async function test(depth, WTM, boardPos, lm, WKPos, BKPos) {
     for (let i = 0; i < moveList.length; i++) {
         const newBoardPos = JSON.parse(JSON.stringify(moveToBoard(moveList[i], boardPos)));
         lm = moveList[i];
-        if (moveList[i].piece.type == King) {
-            if (moveList[i].piece.color == Black) {
+        if (((moveList[i].piece) & 7) == King) {
+            if (((moveList[i].piece) & 24) == Black) {
                 BKPos = moveList[i].posTo;
             } else {
                 WKPos = moveList[i].posTo;
@@ -120,30 +120,50 @@ const PHASE_ROOK = 2;
 const PHASE_QUEEN = 4;
 const PHASE_MAX = PHASE_KNIGHT * 4 + PHASE_BISHOP * 4 + PHASE_ROOK * 4 + PHASE_QUEEN * 2; // 24
 
+const DIAGONAL_MOBILITY_STEPS = [7, 9, -7, -9];
+const ORTHOGONAL_MOBILITY_STEPS = [8, -8, -1, 1];
+
 // Cheap pseudo-mobility: count of squares a sliding piece could reach or
 // capture on, ignoring whether that would leave its own king in check.
 // Mirrors the same ray-walk bounds used throughout chess.js/getcapture.js.
+//
+// Previously built a fresh array of 4 {step, bound, guard} objects (8
+// closures total) on every single call -- once per bishop/rook/queen per
+// Evaluate() call, itself run on every quiescence node, this was one of
+// the largest single self-time costs in the whole engine per profiling.
+// Rewritten to use two hoisted, allocation-free step arrays with the same
+// bound/wrap checks inlined instead of captured in per-call closures:
+// - bound (would `cur + step` land on-board at all) reduces algebraically
+//   to a plain `cur + step` in-range test for every direction (verified
+//   against the original per-direction bound constants: e.g. step 7's
+//   `p <= 56` is exactly `p + 7 <= 63`, step -9's `p >= 9` is exactly
+//   `p - 9 >= 0`, and so on for all eight).
+// - guard (does stepping wrap around a file/rank edge) only does real work
+//   for diagonal steps and for the two horizontal (+1/-1) orthogonal
+//   steps; vertical (+8/-8) steps can never wrap (same file every step) so
+//   they need no check, matching the original's `guard: () => true`.
 function slidingMobility(boardPos, pos, color, diagonal) {
     let count = 0;
-    const dirs = diagonal
-        ? [
-              { step: 7, bound: (p) => p <= 56, guard: (p) => diff(fileAt(p), fileAt(p + 7)) == 1 },
-              { step: 9, bound: (p) => p <= 54, guard: (p) => diff(fileAt(p), fileAt(p + 9)) == 1 },
-              { step: -7, bound: (p) => p >= 7, guard: (p) => diff(fileAt(p), fileAt(p - 7)) == 1 },
-              { step: -9, bound: (p) => p >= 9, guard: (p) => diff(fileAt(p), fileAt(p - 9)) == 1 },
-          ]
-        : [
-              { step: 8, bound: (p) => p <= 55, guard: () => true },
-              { step: -8, bound: (p) => p >= 8, guard: () => true },
-              { step: -1, bound: () => true, guard: (p) => diff(fileAt(pos), fileAt(p - 1)) == 0 },
-              { step: 1, bound: () => true, guard: (p) => diff(fileAt(pos), fileAt(p + 1)) == 0 },
-          ];
-    for (const dir of dirs) {
+    const steps = diagonal ? DIAGONAL_MOBILITY_STEPS : ORTHOGONAL_MOBILITY_STEPS;
+    for (const step of steps) {
         let cur = pos;
-        while (dir.bound(cur) && dir.guard(cur)) {
-            cur += dir.step;
-            if (boardPos[cur].type != None) {
-                if (boardPos[cur].color != color) count++;
+        while (true) {
+            const next = cur + step;
+            if (next < 0 || next > 63) break;
+            // fileAt(x)'s "+1" offset always cancels out of a diff() of two
+            // fileAt() calls, so the wrap check reduces to comparing
+            // cur>>3/next>>3 (equivalent to fileAt's Math.floor(x/8) for
+            // any non-negative x, which cur/next always are here) directly
+            // -- avoids two fileAt() + one diff() call per step, on what
+            // profiling showed was one of the hottest loops in the engine.
+            if (diagonal) {
+                if (Math.abs((cur >> 3) - (next >> 3)) != 1) break;
+            } else if (step === 1 || step === -1) {
+                if ((cur >> 3) != (next >> 3)) break;
+            }
+            cur = next;
+            if (((boardPos[cur]) & 7) != None) {
+                if (((boardPos[cur]) & 24) != color) count++;
                 break;
             }
             count++;
@@ -152,17 +172,30 @@ function slidingMobility(boardPos, pos, color, diagonal) {
     return count;
 }
 
+// Hoisted out of knightMobility: profiling showed a fresh copy of this
+// array (plus its 8 nested arrays) being allocated on every single call --
+// once per knight per Evaluate() call, which itself runs on every
+// quiescence node -- was one of the single largest self-time costs in the
+// whole engine. The values never depend on anything call-specific, so
+// there's no reason to rebuild it every time.
+const KNIGHT_MOBILITY_OFFSETS = [
+    [15, 2, 1], [17, 2, 1], [6, 1, 2], [10, 1, 2],
+    [-15, 2, 1], [-17, 2, 1], [-6, 1, 2], [-10, 1, 2],
+];
+
 function knightMobility(boardPos, pos, color) {
     let count = 0;
-    const offsets = [
-        [15, 2, 1], [17, 2, 1], [6, 1, 2], [10, 1, 2],
-        [-15, 2, 1], [-17, 2, 1], [-6, 1, 2], [-10, 1, 2],
-    ];
-    for (const [off, fd, rd] of offsets) {
+    // fileAt/rankAt's constant offsets always cancel out of a diff() of two
+    // calls (same reasoning as slidingMobility above), so this compares the
+    // raw file-group/rank arithmetic directly instead of calling
+    // fileAt/rankAt/diff sixteen times per knight.
+    const posGroup = pos >> 3;
+    const posRank = pos & 7;
+    for (const [off, fd, rd] of KNIGHT_MOBILITY_OFFSETS) {
         const p = pos + off;
         if (p < 0 || p > 63) continue;
-        if (diff(fileAt(pos), fileAt(p)) == fd && diff(rankAt(pos), rankAt(p)) == rd) {
-            if (boardPos[p].color != color) count++;
+        if (Math.abs(posGroup - (p >> 3)) == fd && Math.abs(posRank - (p & 7)) == rd) {
+            if (((boardPos[p]) & 24) != color) count++;
         }
     }
     return count;
@@ -234,6 +267,83 @@ function kingSafetyScore(kingPos, ownColsRows, enemyColsRows) {
     return score;
 }
 
+// A piece with almost nowhere left to go is at serious risk of being
+// trapped and lost outright a few moves from now -- something the plain
+// per-square mobility bonus above is far too small to flag on its own (its
+// full range is worth well under a fifth of a pawn even at a piece's
+// maximum mobility). This adds a much steeper penalty specifically as
+// legal squares run out, scaled to what the piece itself is worth, so the
+// static eval visibly worsens each move a piece gets boxed in further --
+// well before the actual capture would ever come within the search's
+// horizon. Deliberately ignores whether the remaining squares are
+// themselves safe (that would need a full attack-map lookup inside the
+// hottest function in the engine) -- being down to 0-2 squares to move to
+// AT ALL, safe or not, is already a strong enough trapped-piece signal on
+// its own.
+function lowMobilityPenalty(mobility, pieceValuePawns) {
+    if (mobility >= 3) return 0;
+    return (3 - mobility) * pieceValuePawns * 4;
+}
+
+// A piece sitting on a square the opponent attacks, with nothing of its own
+// side able to recapture there, is about to be lost for nothing -- and
+// unlike a piece merely losing mobility (see lowMobilityPenalty above),
+// this is the direct "is it actually hanging right now" signal, which
+// generic material+PST+mobility terms don't capture at all on their own.
+//
+// Uses squareAttackerType (a per-square scan, chess.js/bitboard.js) rather
+// than either a per-piece getAttackers call or a precomputed whole-board
+// attack map: this function runs once for every piece on the board on
+// every single Evaluate() call, which itself runs at every quiescence node,
+// so profiling drove two iterations here. getAttackers (full attacker list
+// per square) was the dominant search cost on a full 32-piece board;
+// switching to two whole-board getAttackedPosition maps per Evaluate() call
+// helped some but was still a top cost, since it does 64 squares' worth of
+// work whether the board has 3 pieces or 30. squareAttackerType answers
+// "what's the cheapest attacker of THIS square" with the same per-square,
+// early-exit scan isSquareAttacked already uses on the move-legality hot
+// path -- proportional to piece count, not board size, and the cheapest of
+// the three approaches at every piece density tried.
+function hangingPenalty(boardPos, sq, piece) {
+    const enemyColor = ((piece) & 24) === White ? Black : White;
+    const attackerType = squareAttackerType(boardPos, sq, enemyColor);
+    // A lone king "attacking" (standing adjacent to) a piece isn't a real
+    // material threat the way any other attacker is: it only matters if
+    // it's literally the opponent's very next move AND the piece truly has
+    // nowhere to go, which the ordinary search -- many plies deep in
+    // exactly these sparse, low-material positions -- already resolves
+    // correctly on its own. Counting king adjacency here as "hanging"
+    // instead creates a false signal that fights the king-and-major-piece
+    // approaching the lone enemy king -- the core technique needed to
+    // actually deliver mate in these endgames (K+R vs K, K+Q vs K, etc.) --
+    // verified empirically to turn "won but not yet mated" into a
+    // permanent, non-progressing draw. squareAttackerType checks King last
+    // specifically so a real simultaneous attacker is never masked by it.
+    if (attackerType === None || attackerType === King) return 0;
+
+    const pieceVal = pieceValue(((piece) & 7));
+    const minAttackerVal = pieceValue(attackerType);
+
+    if (squareAttackerType(boardPos, sq, ((piece) & 24)) === None) {
+        // Nothing at all recaptures -- any attacker just wins the piece
+        // outright next move. Scaled down from the full value since this
+        // is only a static single-node threat estimate, not a certainty
+        // (the side to move, if it owns this piece, still gets to react),
+        // but it should still dominate over mobility-scale terms, since
+        // losing the piece outright is a near-full-value swing.
+        return pieceVal * 0.9;
+    }
+    if (minAttackerVal < pieceVal) {
+        // Even with a recapture available, the cheapest attacker still
+        // wins material on the exchange (attacker takes the bigger piece,
+        // the defender only recaptures the now-lesser attacker) -- a
+        // "safe" combination for the attacking side regardless of who else
+        // is defending.
+        return (pieceVal - minAttackerVal) * 0.8;
+    }
+    return 0;
+}
+
 // Basic mating technique a generic material+PST eval doesn't otherwise
 // reward: once one side is up overwhelming material and the other has
 // almost nothing left, push the winning king toward the losing king and
@@ -281,37 +391,51 @@ function Evaluate(WTM, boardPos) {
     // PST bonus itself is added afterward, once phase01 is known.
     for (let i = 0; i < 64; i++) {
         const p = boardPos[i];
-        if (p.type == None) continue;
+        if (((p) & 7) == None) continue;
         const col = i % 8;
         const row = Math.floor(i / 8);
 
-        if (p.color == Black) {
-            if (p.type == King) {
+        if (((p) & 7) != King) {
+            const penalty = hangingPenalty(boardPos, i, p);
+            if (((p) & 24) == Black) evalBlack -= penalty;
+            else evalWhite -= penalty;
+        }
+
+        if (((p) & 24) == Black) {
+            if (((p) & 7) == King) {
                 blackKingPos = i;
-            } else if (p.type == Queen) {
+            } else if (((p) & 7) == Queen) {
+                const mob = slidingMobility(boardPos, i, Black, true) + slidingMobility(boardPos, i, Black, false);
                 evalBlack += 900 + queenMap[i] / 10;
-                evalBlack += slidingMobility(boardPos, i, Black, true) + slidingMobility(boardPos, i, Black, false);
+                evalBlack += mob;
+                evalBlack -= lowMobilityPenalty(mob, 9);
                 phaseAccum += PHASE_QUEEN;
                 blackMaterial += 9;
-            } else if (p.type == Rook) {
+            } else if (((p) & 7) == Rook) {
+                const mob = slidingMobility(boardPos, i, Black, false);
                 evalBlack += 500;
-                evalBlack += 2 * slidingMobility(boardPos, i, Black, false);
+                evalBlack += 2 * mob;
+                evalBlack -= lowMobilityPenalty(mob, 5);
                 blackRookSquares.push(i);
                 phaseAccum += PHASE_ROOK;
                 blackMaterial += 5;
-            } else if (p.type == Knight) {
+            } else if (((p) & 7) == Knight) {
+                const mob = knightMobility(boardPos, i, Black);
                 evalBlack += 300 + knightMap[i] / 10;
-                evalBlack += 2 * knightMobility(boardPos, i, Black);
+                evalBlack += 2 * mob;
+                evalBlack -= lowMobilityPenalty(mob, 3);
                 phaseAccum += PHASE_KNIGHT;
                 blackMaterial += 3;
-            } else if (p.type == Bishop) {
+            } else if (((p) & 7) == Bishop) {
+                const mob = slidingMobility(boardPos, i, Black, true);
                 evalBlack += 300 + bishopMap[i] / 10;
-                evalBlack += 2 * slidingMobility(boardPos, i, Black, true);
+                evalBlack += 2 * mob;
+                evalBlack -= lowMobilityPenalty(mob, 3);
                 blackBishops++;
                 blackBishopSquares.push(i);
                 phaseAccum += PHASE_BISHOP;
                 blackMaterial += 3;
-            } else if (p.type == Pawn) {
+            } else if (((p) & 7) == Pawn) {
                 evalBlack += 100;
                 blackPawnSquares.push(i);
                 blackPawnColsRows[col].push(row);
@@ -319,32 +443,40 @@ function Evaluate(WTM, boardPos) {
                 blackMaterial += 1;
             }
         } else {
-            if (p.type == King) {
+            if (((p) & 7) == King) {
                 whiteKingPos = i;
-            } else if (p.type == Queen) {
+            } else if (((p) & 7) == Queen) {
+                const mob = slidingMobility(boardPos, i, White, true) + slidingMobility(boardPos, i, White, false);
                 evalWhite += 900 + queenMap[mirrorRank(i)] / 10;
-                evalWhite += slidingMobility(boardPos, i, White, true) + slidingMobility(boardPos, i, White, false);
+                evalWhite += mob;
+                evalWhite -= lowMobilityPenalty(mob, 9);
                 phaseAccum += PHASE_QUEEN;
                 whiteMaterial += 9;
-            } else if (p.type == Rook) {
+            } else if (((p) & 7) == Rook) {
+                const mob = slidingMobility(boardPos, i, White, false);
                 evalWhite += 500;
-                evalWhite += 2 * slidingMobility(boardPos, i, White, false);
+                evalWhite += 2 * mob;
+                evalWhite -= lowMobilityPenalty(mob, 5);
                 whiteRookSquares.push(i);
                 phaseAccum += PHASE_ROOK;
                 whiteMaterial += 5;
-            } else if (p.type == Knight) {
+            } else if (((p) & 7) == Knight) {
+                const mob = knightMobility(boardPos, i, White);
                 evalWhite += 300 + knightMap[mirrorRank(i)] / 10;
-                evalWhite += 2 * knightMobility(boardPos, i, White);
+                evalWhite += 2 * mob;
+                evalWhite -= lowMobilityPenalty(mob, 3);
                 phaseAccum += PHASE_KNIGHT;
                 whiteMaterial += 3;
-            } else if (p.type == Bishop) {
+            } else if (((p) & 7) == Bishop) {
+                const mob = slidingMobility(boardPos, i, White, true);
                 evalWhite += 300 + bishopMap[mirrorRank(i)] / 10;
-                evalWhite += 2 * slidingMobility(boardPos, i, White, true);
+                evalWhite += 2 * mob;
+                evalWhite -= lowMobilityPenalty(mob, 3);
                 whiteBishops++;
                 whiteBishopSquares.push(i);
                 phaseAccum += PHASE_BISHOP;
                 whiteMaterial += 3;
-            } else if (p.type == Pawn) {
+            } else if (((p) & 7) == Pawn) {
                 evalWhite += 100;
                 whitePawnSquares.push(i);
                 whitePawnColsRows[col].push(row);
@@ -414,16 +546,22 @@ function Evaluate(WTM, boardPos) {
     evalWhite += pawnStructureScore(whitePawnColsRows, blackPawnColsRows, true, whiteKingPos, blackKingPos);
     evalBlack += pawnStructureScore(blackPawnColsRows, whitePawnColsRows, false, blackKingPos, whiteKingPos);
 
-    for (let i = 0; i < 64; i++) {
-        const p = boardPos[i];
-        if (p.type != Rook) continue;
-        const col = i % 8;
-        const ownPawns = p.color == White ? whitePawnColsRows : blackPawnColsRows;
-        const enemyPawns = p.color == White ? blackPawnColsRows : whitePawnColsRows;
-        if (ownPawns[col].length === 0) {
-            const bonus = enemyPawns[col].length === 0 ? 20 : 10;
-            if (p.color == White) evalWhite += bonus;
-            else evalBlack += bonus;
+    // Rook on an open/semi-open file: reuses whiteRookSquares/blackRookSquares
+    // (already collected by the main per-square loop above, for the PST
+    // scoring just above this) instead of re-scanning all 64 squares again
+    // just to re-find the same rooks -- Evaluate() runs on every quiescence
+    // leaf (the single most frequently visited node type in the whole
+    // search), so a whole extra O(64) pass here was pure waste.
+    for (const sq of whiteRookSquares) {
+        const col = sq % 8;
+        if (whitePawnColsRows[col].length === 0) {
+            evalWhite += blackPawnColsRows[col].length === 0 ? 20 : 10;
+        }
+    }
+    for (const sq of blackRookSquares) {
+        const col = sq % 8;
+        if (blackPawnColsRows[col].length === 0) {
+            evalBlack += whitePawnColsRows[col].length === 0 ? 20 : 10;
         }
     }
 
@@ -476,14 +614,14 @@ const transpositionTable = new Array(TT_SIZE).fill(null);
 
 function pieceIndex(piece) {
     // White: type-1 (0-5), Black: type-1+6 (6-11)
-    return (piece.color === White ? 0 : 6) + (piece.type - 1);
+    return (((piece) & 24) === White ? 0 : 6) + (((piece) & 7) - 1);
 }
 
 function computeHash(boardPos, WTM) {
     let h = 0;
     for (let i = 0; i < 64; i++) {
         const p = boardPos[i];
-        if (p.type !== None) {
+        if (((p) & 7) !== None) {
             h = (h ^ zobristPieces[i][pieceIndex(p)]) >>> 0;
         }
     }
@@ -504,7 +642,7 @@ function updateHashForMove(hash, move) {
 
     if (move.isEnp) {
         h = (h ^ zobristPieces[move.enpTo][pieceIndex(move.attPiece)]) >>> 0;
-    } else if (move.attPiece.type !== None) {
+    } else if (((move.attPiece) & 7) !== None) {
         h = (h ^ zobristPieces[move.posTo][pieceIndex(move.attPiece)]) >>> 0;
     }
 
@@ -514,7 +652,7 @@ function updateHashForMove(hash, move) {
     if (move.isCastle) {
         const rookFrom = move.castleType === "l" ? move.posTo - 2 : move.posTo + 1;
         const rookTo = move.castleType === "l" ? move.posTo + 1 : move.posTo - 1;
-        const rookIdx = pieceIndex({ color: move.piece.color, type: Rook });
+        const rookIdx = pieceIndex(((move.piece) & 24) | Rook);
         h = (h ^ zobristPieces[rookFrom][rookIdx]) >>> 0;
         h = (h ^ zobristPieces[rookTo][rookIdx]) >>> 0;
     }
@@ -535,10 +673,36 @@ function nullMoveHash(hash) {
 // same position, only replace with equal-or-deeper data, so a slower, more
 // valuable deep search result isn't evicted by a shallower one probing the
 // same position again later (e.g. via a transposition or a null-move check).
+//
+// Writes into the existing slot array's fields in place (existing[0] = ...)
+// rather than replacing transpositionTable[ttIndex] with a freshly literal
+// array, for every slot that's already been touched at least once -- this
+// function runs roughly once per internal search node, so "allocate a new
+// 5-element array" was one of the hottest per-node allocations in the whole
+// engine. Only ever allocates on a slot's very first-ever write (existing
+// === null), so this costs nothing extra up front: the table still starts
+// as TT_SIZE cheap nulls, and memory grows exactly as it always did, one
+// real array per slot actually used -- just without re-allocating that same
+// array over and over on every later write to an already-used slot.
+//
+// Caller note: SearchNode's own TT probe (`const tte = transpositionTable
+// [ttIndex]`) never holds onto `tte` across a recursive Search call, only
+// reading its fields immediately and copying out `hashMove` (a Move
+// reference, not the slot array itself) -- that invariant now matters for
+// correctness, not just style, since a slot array can be mutated later by
+// an unrelated node that happens to collide on the same ttIndex. Don't add
+// a new `tte` read that survives across a recursive call without accounting
+// for that.
 function storeTTEntry(ttIndex, hash, depth, value, flag, move) {
     const existing = transpositionTable[ttIndex];
-    if (existing === null || existing[0] !== hash || depth >= existing[1]) {
+    if (existing === null) {
         transpositionTable[ttIndex] = [hash, depth, value, flag, move];
+    } else if (existing[0] !== hash || depth >= existing[1]) {
+        existing[0] = hash;
+        existing[1] = depth;
+        existing[2] = value;
+        existing[3] = flag;
+        existing[4] = move;
     }
 }
 // --- End Transposition Table ---
@@ -562,6 +726,24 @@ const MAX_KILLER_DEPTH = 64;
 let killerMoves = Array.from({ length: MAX_KILLER_DEPTH }, () => [null, null]);
 let historyTable = new Array(64 * 64).fill(0);
 
+// Preallocated, ply-indexed scratch arrays for "quiet moves actually
+// searched at this node so far" (see quietsSearched in SearchNode) --
+// reused across calls instead of allocating a fresh array on every single
+// SearchNode invocation, the same grow-on-demand pooling chess.js's
+// getUndoSlot already uses for make/unmake. Indexing by ply (not depth) is
+// what makes reuse safe: within one root-to-current-node call chain, ply
+// increases by exactly one at every recursive Search call, so no two
+// SIMULTANEOUSLY ACTIVE SearchNode frames ever share a slot -- a sibling
+// reusing the same ply only ever does so after the previous occupant has
+// already returned.
+const quietsScratchPool = [];
+function getQuietsScratch(ply) {
+    while (quietsScratchPool.length <= ply) quietsScratchPool.push([]);
+    const arr = quietsScratchPool[ply];
+    arr.length = 0;
+    return arr;
+}
+
 function moveEquals(a, b) {
     if (!a || !b) return false;
     return a.pos === b.pos && a.posTo === b.posTo && a.isPromoted === b.isPromoted;
@@ -576,7 +758,47 @@ function resetSearchState() {
     historyTable.fill(0);
 }
 
-function Search(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, extensionsUsed, hash) {
+// Mate scoring: a forced mate is worth MATE_SCORE minus the number of plies
+// it takes to deliver (see the moveList.length === 0 case in SearchNode
+// below), instead of a single flat constant regardless of distance. Without
+// this, every forced mate -- whether delivered in 2 plies or 20 -- looked
+// identical to the search (exactly ±999999), so alpha-beta had no basis to
+// prefer the faster one: whichever mating line move ordering happened to
+// examine first won the tie, which is what let the AI "find a mate" while
+// shuffling for many extra moves instead of finishing in the minimum number.
+// Decaying by ply also gives the search a reason to keep pushing toward
+// mate every move rather than drifting into a repetition/50-move draw once
+// a won-but-not-yet-mating endgame (e.g. K+R vs K) is reached, since a
+// nearer mate now strictly outscores a more distant one instead of tying.
+const MATE_SCORE = 900000;
+// Any |score| beyond this is a mate score (MATE_SCORE minus some ply count
+// far below this margin) rather than a real positional evaluation -- used
+// to tell the two apart when adjusting scores for TT storage/retrieval and
+// when deciding whether iterative deepening can stop early.
+const MATE_THRESHOLD = MATE_SCORE - 1000;
+
+// Transposition table entries are keyed only by position, not by the ply at
+// which they were reached, but a mate score returned from deep in the tree
+// is only meaningful relative to the ply it was found at (e.g. "mate in 3
+// from here"). Storing/retrieving it as one flat number would silently
+// change its meaning ("mate in 3 from here" is a different absolute score
+// depending on how far "here" is from the actual search root) the moment a
+// transposition reaches that same position at a different ply. The
+// standard fix: normalize to "distance from this node" before storing
+// (independent of path), then re-express relative to the current root once
+// retrieved.
+function scoreToTT(score, ply) {
+    if (score >= MATE_THRESHOLD) return score + ply;
+    if (score <= -MATE_THRESHOLD) return score - ply;
+    return score;
+}
+function scoreFromTT(score, ply) {
+    if (score >= MATE_THRESHOLD) return score - ply;
+    if (score <= -MATE_THRESHOLD) return score + ply;
+    return score;
+}
+
+function Search(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, extensionsUsed, hash, ply) {
     asdsa++;
     if (searchAborted) return alpha;
     if ((asdsa & 2047) === 0 && Date.now() > searchDeadline) {
@@ -584,7 +806,7 @@ function Search(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, extensionsU
         return alpha;
     }
     if (depth === 0) {
-        return SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, alpha, beta);
+        return SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, alpha, beta, ply, 0);
     }
 
     // hash arrives pre-computed via updateHashForMove/nullMoveHash at the
@@ -619,7 +841,7 @@ function Search(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, extensionsU
     searchPathCounts.set(hash, (searchPathCounts.get(hash) || 0) + 1);
     let result;
     try {
-        result = SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, extensionsUsed || 0);
+        result = SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, extensionsUsed || 0, ply);
     } finally {
         const c = searchPathCounts.get(hash) - 1;
         if (c <= 0) searchPathCounts.delete(hash);
@@ -628,7 +850,7 @@ function Search(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, extensionsU
     return result;
 }
 
-function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, extensionsUsed) {
+function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, extensionsUsed, ply) {
     const originalAlpha = alpha;
     const ttIndex = hash & TT_MASK;
     const tte = transpositionTable[ttIndex];
@@ -639,23 +861,88 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
         if (tte[4]) hashMove = tte[4];
         // Only use the stored eval if the entry was searched at least as deep
         if (tte[1] >= depth) {
-            if (tte[3] === TT_EXACT)                    return tte[2];
-            if (tte[3] === TT_ALPHA && tte[2] <= alpha) return alpha;
-            if (tte[3] === TT_BETA  && tte[2] >= beta)  return beta;
+            const ttScore = scoreFromTT(tte[2], ply);
+            if (tte[3] === TT_EXACT)                     return ttScore;
+            if (tte[3] === TT_ALPHA && ttScore <= alpha) return alpha;
+            if (tte[3] === TT_BETA  && ttScore >= beta)  return beta;
         }
     }
 
     let color;
     let kingPos;
-    if (lm.piece.color == White) {
+    if (((lm.piece) & 24) == White) {
         color = White;
         kingPos = BKPos;
     } else {
         color = Black;
         kingPos = WKPos;
     }
-    let attackedPos = getAttackedPosition(boardPos, color);
-    const inCheck = attackedPos[kingPos] !== 0;
+    const inCheck = isSquareAttacked(boardPos, kingPos, color);
+
+    // Internal Iterative Reduction: no stored move from a prior search of
+    // this exact position (hashMove above) means this node's move ordering
+    // is flying blind -- searching it at full depth anyway is comparatively
+    // expensive for what it's likely to learn. Shaving one ply off instead
+    // (the same "look cheaper first" idea LMR already applies per-move,
+    // just applied to the whole node) still populates the TT with a real
+    // best move for this position, which any later revisit (a
+    // transposition, or the next iterative-deepening pass) then gets to use
+    // for full-strength ordering immediately. `depth` is mutated in place
+    // (not just used locally) so every depth-dependent read below --
+    // canPruneByEval, the RFP/futility margins, childDepth, LMR, and both
+    // storeTTEntry calls at the bottom of this function -- consistently
+    // reflects the node actually having been searched one ply shallower;
+    // the TT entry MUST record the depth actually used, or a later
+    // `tte[1] >= depth` check elsewhere would wrongly trust it as if it were
+    // one ply deeper than it really is. Requires depth >= 5 (strictly above
+    // PRUNING_MAX_DEPTH even after the decrement) so this never newly
+    // qualifies a node for the shallow-depth pruning below that wouldn't
+    // already have qualified without it, and pieceCount > 6 plus !inCheck
+    // for the same sparse-endgame/unreliable-static-picture reasons
+    // canPruneByEval itself is gated that way (see its own comment) --
+    // guessing wrong about "probably not worth full depth" is most costly
+    // in exactly those two situations.
+    const IIR_MIN_DEPTH = 5;
+    if (hashMove === null && depth >= IIR_MIN_DEPTH && !inCheck && pieceCount > 6) {
+        depth--;
+    }
+
+    // Both reverse futility pruning (below) and per-move futility pruning
+    // (in the move loop) need the position's static eval, but only at
+    // shallow depth, never while in check (the static eval is unreliable
+    // mid-check -- material can swing wildly on the very next forced
+    // reply), and never near a mate score (a plain material margin
+    // comparison is meaningless once mate distance dominates the score --
+    // see MATE_THRESHOLD). Also gated on pieceCount > 6, the SAME threshold
+    // null-move pruning above already uses and for the same underlying
+    // reason: in a low-material endgame, a "quiet" move is often exactly
+    // the precise check or king step that delivers the mate, and pruning
+    // it because it doesn't change material is exactly wrong there. This
+    // was verified empirically, not theoretically -- an earlier version
+    // without this guard passed every other regression check but caused
+    // the search to flicker between "mate found" and "no mate" forever in
+    // a real K+R vs K endgame, never actually completing it, because the
+    // one quiet check that finishes the mate kept getting futility-pruned
+    // away. Dense middlegame positions (where this pruning's real payoff
+    // is) are unaffected by the guard; sparse endgames already reach deep
+    // depths easily without it, so there's little speed to trade away.
+    const PRUNING_MAX_DEPTH = 3;
+    const canPruneByEval = !inCheck && depth <= PRUNING_MAX_DEPTH && pieceCount > 6 &&
+        Math.abs(beta) < MATE_THRESHOLD && Math.abs(alpha) < MATE_THRESHOLD;
+    const staticEval = canPruneByEval ? Evaluate(WTM, boardPos) : null;
+
+    // Reverse futility pruning (a.k.a. static null-move pruning): if the
+    // position already looks this good from a plain static eval, well
+    // beyond what any single real move at this shallow a depth could
+    // plausibly swing away, assume the opponent has nothing that prevents
+    // it from holding up and prune the entire node -- no moves generated,
+    // no recursion. The margin widens per remaining ply since more depth
+    // means more chances for the position to actually turn out worse than
+    // it looks right now.
+    const RFP_MARGIN_PER_DEPTH = 0.9;
+    if (canPruneByEval && staticEval - RFP_MARGIN_PER_DEPTH * depth >= beta) {
+        return beta;
+    }
 
     // Check extension: when in check, search one ply deeper before
     // decrementing depth, since forced replies to check are often critical
@@ -671,19 +958,19 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
     // whole subtree is safe to prune. Disabled in check (can't legally pass
     // out of check), in low-material endgames (zugzwang risk — passing can
     // look artificially good when any real move would worsen the position),
-    // and right after another null move (lm.piece.type === None marks that;
-    // two passes in a row just reproduce the original position).
-    if (depth >= 3 && !inCheck && pieceCount > 6 && lm.piece.type !== None) {
+    // and right after another null move (((lm.piece) & 7) === None marks
+    // that; two passes in a row just reproduce the original position).
+    if (depth >= 3 && !inCheck && pieceCount > 6 && ((lm.piece) & 7) !== None) {
         const R = 2;
-        const nullMove = { piece: { color: WTM ? White : Black, type: None }, pos: -1, posTo: -1 };
-        const nullScore = -Search(depth - 1 - R, !WTM, boardPos, nullMove, WKPos, BKPos, -beta, -beta + 1, extensionsUsed, nullMoveHash(hash));
+        const nullMove = { piece: ((WTM ? White : Black) | (None) | ((false) ? 32 : 0)), pos: -1, posTo: -1 };
+        const nullScore = -Search(depth - 1 - R, !WTM, boardPos, nullMove, WKPos, BKPos, -beta, -beta + 1, extensionsUsed, nullMoveHash(hash), ply + 1);
         if (searchAborted) return alpha;
         if (nullScore >= beta) {
             return beta;
         }
     }
 
-    let moveList = sortMoves(getAllMoves(WTM, boardPos, lm, WKPos, BKPos), attackedPos, depth, boardPos);
+    let moveList = sortMoves(getAllMoves(WTM, boardPos, lm, WKPos, BKPos), boardPos, color, depth);
 
     // Move the hash move to the front so it is searched first
     if (hashMove !== null) {
@@ -693,17 +980,99 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
 
     const nextWTM = !WTM;
     if (moveList.length === 0) {
-        return inCheck ? -999999 : 0;
+        return inCheck ? -(MATE_SCORE - ply) : 0;
     }
 
     let bestMove = null;
 
+    // Futility pruning margins for the per-move skip below: how much a
+    // quiet move would need to be underestimated by for it to actually
+    // matter, scaled by remaining depth the same way the reverse futility
+    // margin above is.
+    const FUTILITY_MARGIN_BASE = 0.75;
+    const FUTILITY_MARGIN_PER_DEPTH = 0.75;
+
+    // Late Move Pruning thresholds: how many quiet moves get a full look
+    // before the rest are skipped outright, scaled quadratically with
+    // remaining depth so deeper (more consequential) nodes stay more
+    // lenient than shallow ones -- see the LMP skip below, which shares
+    // canPruneByEval's safety gate with the futility pruning here.
+    const LMP_BASE = 3;
+    const LMP_SCALE = 2;
+
+    // Quiet moves actually searched at this node so far (i.e. that reached
+    // make/unmake below, not ones skipped by futility/LMP) -- used only by
+    // the history-malus update on a beta cutoff further down, so every
+    // OTHER quiet move tried and found wanting here gets pushed down in
+    // future move ordering, not just the one move that eventually wins
+    // gets pushed up. Pulled from a preallocated per-ply pool (see
+    // getQuietsScratch) instead of `[]` here, since this function runs at
+    // every non-leaf node in the tree.
+    const quietsSearched = getQuietsScratch(ply);
+
     for (let i = 0; i < moveList.length; i++) {
         const move = moveList[i];
+        const attType = ((move.attPiece) & 7);
+        const isQuiet = attType === None && !move.isPromoted;
+
+        // Futility pruning: once the position's static eval plus a
+        // generous margin still can't reach alpha, a QUIET move this deep
+        // in the tree essentially never recovers the gap -- it doesn't
+        // change material, and everything else about the position is
+        // already priced into staticEval. Skipped for captures/promotions
+        // (they DO change material, the whole premise doesn't apply) and
+        // never for the first, best-ordered move, so every node with any
+        // moves at all still gets at least one full-strength search --
+        // this can only ever fail low at the existing alpha, never starve
+        // a node of real information entirely. Doesn't check whether the
+        // move gives check, same accepted tradeoff as the LMR skip below:
+        // a few quiet checks get pruned here that a check-aware version
+        // would search, in exchange for not paying isSquareAttacked's cost
+        // on every single candidate quiet move just to find out.
+        if (canPruneByEval && i > 0 && isQuiet &&
+            staticEval + FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth <= alpha) {
+            continue;
+        }
+
+        // Late Move Pruning: past a certain move index (scaled by depth --
+        // more room at deeper depths, since 20th-of-40 isn't nearly as
+        // suspect as 20th-of-25), a QUIET move this shallow in the tree is
+        // overwhelmingly likely to be exactly what its bad move-ordering
+        // score already suggests. Same canPruneByEval safety gate as the
+        // futility pruning just above -- including the same K+R-vs-K
+        // mating-line guard described where canPruneByEval is defined --
+        // since this prunes purely on move COUNT regardless of eval, and
+        // would otherwise hit the exact same failure mode in a sparse
+        // endgame.
+        if (canPruneByEval && i > 0 && isQuiet &&
+            i >= LMP_BASE + LMP_SCALE * depth * depth) {
+            continue;
+        }
+
+        // SEE pruning: a capture that loses material outright by SEE
+        // (already computed once by sortMoves into moveScoreGuess -- see
+        // seeCapture) essentially never turns out to matter this shallow in
+        // the tree -- exactly the same reasoning quiescence already applies
+        // via its own `moveScoreGuess >= 0` filter (SearchAllCapture). This
+        // just extends that identical, already-trusted filter to shallow
+        // main-search nodes, reusing moveScoreGuess directly rather than
+        // recomputing SEE. Explicitly requires attType !== None (a real
+        // capture, not a quiet move) rather than trusting moveScoreGuess's
+        // sign alone -- history malus below can drive a quiet move's guess
+        // negative too, and this must never be the thing that prunes a
+        // quiet move (that's LMP's job above, with its own move-count
+        // rationale).
+        if (canPruneByEval && i > 0 && attType !== None && !move.isPromoted &&
+            move.moveScoreGuess < 0) {
+            continue;
+        }
+
+        if (isQuiet) quietsSearched.push(move);
+
         let childWKPos = WKPos;
         let childBKPos = BKPos;
-        if (move.piece.type == King) {
-            if (move.piece.color == Black) childBKPos = move.posTo;
+        if (((move.piece) & 7) == King) {
+            if (((move.piece) & 24) == Black) childBKPos = move.posTo;
             else childWKPos = move.posTo;
         }
         const childHash = updateHashForMove(hash, move);
@@ -731,7 +1100,7 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
         // re-search safety net already covers.
         const LMR_MIN_DEPTH = 3;
         const LMR_MIN_MOVE_INDEX = 3;
-        const canReduce = i >= LMR_MIN_MOVE_INDEX && depth >= LMR_MIN_DEPTH && !inCheck && move.attPiece.type === None && !move.isPromoted;
+        const canReduce = i >= LMR_MIN_MOVE_INDEX && depth >= LMR_MIN_DEPTH && !inCheck && ((move.attPiece) & 7) === None && !move.isPromoted;
         const reduction = canReduce ? (i >= 6 ? 2 : 1) : 0;
 
         // Make/unmake: boardPos is ONE shared, mutable array for the whole
@@ -744,17 +1113,17 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
         const undo = makeMove(move, boardPos);
         try {
             if (i === 0) {
-                evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash);
+                evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash, ply + 1);
             } else {
                 const reducedDepth = Math.max(0, childDepth - reduction);
-                evalScore = -Search(reducedDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash);
+                evalScore = -Search(reducedDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash, ply + 1);
                 if (!searchAborted && reduction > 0 && evalScore > alpha) {
                     // The reduced look unexpectedly beat alpha -- confirm at the
                     // real depth before trusting it (still null-window).
-                    evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash);
+                    evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, childExtensions, childHash, ply + 1);
                 }
                 if (!searchAborted && evalScore > alpha && evalScore < beta) {
-                    evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash);
+                    evalScore = -Search(childDepth, nextWTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, childExtensions, childHash, ply + 1);
                 }
             }
         } finally {
@@ -764,14 +1133,29 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
         if (searchAborted) return alpha;
 
         if (evalScore >= beta) {
-            if (move.attPiece.type === None && !move.isPromoted) {
+            if (isQuiet) {
                 if (depth < MAX_KILLER_DEPTH && !moveEquals(killerMoves[depth][0], move)) {
                     killerMoves[depth][1] = killerMoves[depth][0];
                     killerMoves[depth][0] = move;
                 }
                 historyTable[move.pos * 64 + move.posTo] += depth * depth;
             }
-            storeTTEntry(ttIndex, hash, depth, beta, TT_BETA, move);
+            // History malus: every OTHER quiet move already searched at
+            // this node (whether or not the move that actually caused this
+            // cutoff was itself quiet) turned out not to be good enough to
+            // cause it -- push their history score down by the same margin
+            // a cutting quiet move gets pushed up just above. Without this,
+            // a quiet move that gets tried constantly but rarely cuts looks
+            // identical to sortMoves as one that's tried rarely but always
+            // cuts, even though telling those two apart is the entire point
+            // of the history heuristic. Compared by reference (not
+            // moveEquals) since quietsSearched holds the exact Move objects
+            // from this node's own moveList.
+            for (let j = 0; j < quietsSearched.length; j++) {
+                const qm = quietsSearched[j];
+                if (qm !== move) historyTable[qm.pos * 64 + qm.posTo] -= depth * depth;
+            }
+            storeTTEntry(ttIndex, hash, depth, scoreToTT(beta, ply), TT_BETA, move);
             return beta;
         }
         if (evalScore > alpha) {
@@ -781,7 +1165,7 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
     }
 
     const flag = alpha <= originalAlpha ? TT_ALPHA : TT_EXACT;
-    storeTTEntry(ttIndex, hash, depth, alpha, flag, bestMove);
+    storeTTEntry(ttIndex, hash, depth, scoreToTT(alpha, ply), flag, bestMove);
 
     return alpha;
 }
@@ -789,32 +1173,32 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
 function boardToText(boardPos) {
     let str = "";
     for (let i = 0; i < 64; i++) {
-        if (boardPos[i].color == Black) {
-            if (boardPos[i].type == King) {
+        if (((boardPos[i]) & 24) == Black) {
+            if (((boardPos[i]) & 7) == King) {
                 str += "k";
-            } else if (boardPos[i].type == Queen) {
+            } else if (((boardPos[i]) & 7) == Queen) {
                 str += "q";
-            } else if (boardPos[i].type == Rook) {
+            } else if (((boardPos[i]) & 7) == Rook) {
                 str += "r";
-            } else if (boardPos[i].type == Knight) {
+            } else if (((boardPos[i]) & 7) == Knight) {
                 str += "n";
-            } else if (boardPos[i].type == Bishop) {
+            } else if (((boardPos[i]) & 7) == Bishop) {
                 str += "b";
-            } else if (boardPos[i].type == Pawn) {
+            } else if (((boardPos[i]) & 7) == Pawn) {
                 str += "p";
             }
-        } else if (boardPos[i].color == White) {
-            if (boardPos[i].type == King) {
+        } else if (((boardPos[i]) & 24) == White) {
+            if (((boardPos[i]) & 7) == King) {
                 str += "K";
-            } else if (boardPos[i].type == Queen) {
+            } else if (((boardPos[i]) & 7) == Queen) {
                 str += "Q";
-            } else if (boardPos[i].type == Rook) {
+            } else if (((boardPos[i]) & 7) == Rook) {
                 str += "R";
-            } else if (boardPos[i].type == Knight) {
+            } else if (((boardPos[i]) & 7) == Knight) {
                 str += "N";
-            } else if (boardPos[i].type == Bishop) {
+            } else if (((boardPos[i]) & 7) == Bishop) {
                 str += "B";
-            } else if (boardPos[i].type == Pawn) {
+            } else if (((boardPos[i]) & 7) == Pawn) {
                 str += "P";
             }
         } else {
@@ -824,64 +1208,110 @@ function boardToText(boardPos) {
     return str;
 }
 
-function SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, alpha, beta) {
+// Unlike captures (naturally self-limiting -- there are only so many pieces
+// left to take), a chain of checks isn't bounded by anything on its own: a
+// forced sequence of check-evade-check-evade could otherwise recurse the
+// full-legal-move branch below arbitrarily deep, burning the entire search's
+// time budget inside one quiescence call instead of getting anywhere near
+// the rest of the tree. Capped the same way the main search already caps
+// check EXTENSIONS (see MAX_CHECK_EXTENSIONS in SearchNode) -- past this
+// many chained in-check plies within a single quiescence call tree, fall
+// back to the plain stand-pat/captures-only handling even though still in
+// check, accepting the same small horizon imprecision the main search's own
+// cap already accepts.
+const MAX_QUIESCENCE_CHECK_PLIES = 6;
+
+function SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, alpha, beta, ply, qCheckPlies) {
     asdsa++;
     if (searchAborted) return alpha;
     if ((asdsa & 2047) === 0 && Date.now() > searchDeadline) {
         searchAborted = true;
         return alpha;
     }
+
+    // opponentColor (the side NOT currently to move) is needed both to
+    // judge whether a capture's destination square is defended (the
+    // sortMoves SEE-skip fast path below) and to tell whether the side to
+    // move is in check (ownKingPos below).
+    const opponentColor = WTM ? Black : White;
+    const ownKingPos = WTM ? WKPos : BKPos;
+    const inCheck = isSquareAttacked(boardPos, ownKingPos, opponentColor);
+
+    // Captures alone aren't enough while in check: a forced king move,
+    // block, or capture of the checking piece might be the ONLY way to
+    // survive, and none of those are guaranteed to be a "capture" the
+    // ordinary quiescence loop below would ever generate. Without this,
+    // a checkmate landing exactly at the search horizon was invisible --
+    // SearchAllCapture would just statically evaluate the position (still
+    // materially fine-looking, one move before disaster) instead of
+    // recognizing the forced loss. Falls back to searching every legal
+    // reply, same as the main search, but only when in check -- doing this
+    // unconditionally would mean generating full move lists at every single
+    // quiescence node, defeating the point of a captures-only search.
+    if (inCheck && qCheckPlies < MAX_QUIESCENCE_CHECK_PLIES) {
+        const replies = sortMoves(getAllMoves(WTM, boardPos, lm, WKPos, BKPos), boardPos, opponentColor, null);
+        if (replies.length === 0) {
+            return -(MATE_SCORE - ply);
+        }
+        for (let i = 0; i < replies.length; i++) {
+            const move = replies[i];
+            let childWKPos = WKPos;
+            let childBKPos = BKPos;
+            if (((move.piece) & 7) == King) {
+                if (((move.piece) & 24) == Black) childBKPos = move.posTo;
+                else childWKPos = move.posTo;
+            }
+            let evalScore;
+            const undo = makeMove(move, boardPos);
+            try {
+                evalScore = -SearchAllCapture(!WTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, ply + 1, qCheckPlies + 1);
+            } finally {
+                unmakeMove(undo, boardPos);
+            }
+            if (evalScore >= beta) return beta;
+            if (evalScore > alpha) alpha = evalScore;
+        }
+        return alpha;
+    }
+
     let eval = Evaluate(WTM, boardPos);
     if (eval >= beta) {
         return beta;
     }
     alpha = Math.max(alpha, eval);
-    let color;
-    let kingPos;
-    if (lm.piece.color == White) {
-        color = Black;
-        kingPos = BKPos;
-    } else {
-        color = White;
-        kingPos = WKPos;
-    }
-    let attackedPos = getAttackedPosition(boardPos, color);
+
     // sortMoves scores every capture by SEE (in moveScoreGuess, scaled by
     // 100) — reuse that instead of recomputing, and skip captures that lose
     // material outright: exploring them in quiescence essentially never
     // helps once the "stand pat" static eval is already being compared
     // against alpha above.
-    let moveList = sortMoves(getAllCaptureMoves(WTM, boardPos, lm, WKPos, BKPos), attackedPos, null, boardPos)
+    let moveList = sortMoves(getAllCaptureMoves(WTM, boardPos, lm, WKPos, BKPos, ply), boardPos, opponentColor, null)
         .filter((move) => move.moveScoreGuess >= 0);
-    if (WTM) {
-        kingPos = WKPos;
-        WTM = false;
-    } else {
-        kingPos = BKPos;
-        WTM = true;
-    }
 
     for (let i = 0; i < moveList.length; i++) {
         const move = moveList[i];
-        lm = move;
-        let eval;
+        let childWKPos = WKPos;
+        let childBKPos = BKPos;
+        if (((move.piece) & 7) == King) {
+            if (((move.piece) & 24) == Black) childBKPos = move.posTo;
+            else childWKPos = move.posTo;
+        }
+        let evalScore;
         const undo = makeMove(move, boardPos);
         try {
-            if (move.piece.type == King) {
-                if (move.piece.color == Black) {
-                    eval = -SearchAllCapture(WTM, boardPos, lm, WKPos, move.posTo, -beta, -alpha);
-                } else {
-                    eval = -SearchAllCapture(WTM, boardPos, lm, move.posTo, BKPos, -beta, -alpha);
-                }
-            } else {
-                eval = -SearchAllCapture(WTM, boardPos, lm, WKPos, BKPos, -beta, -alpha);
-            }
+            // qCheckPlies carries over unchanged here (not reset to 0): a
+            // capture doesn't "use up" the in-check budget, but it also
+            // shouldn't refill it -- only the in-check branch above ever
+            // increments it, so an ordinary capture reply just passes
+            // through whatever budget remains from before.
+            evalScore = -SearchAllCapture(!WTM, boardPos, move, childWKPos, childBKPos, -beta, -alpha, ply + 1, qCheckPlies);
         } finally {
             unmakeMove(undo, boardPos);
         }
-        if (eval >= beta) {
+        if (evalScore >= beta) {
             return beta;
         }
+        if (evalScore > alpha) alpha = evalScore;
     }
 
     return alpha;
@@ -921,10 +1351,10 @@ function getAttackers(boardPos, square, color) {
     forEachBit(and64(PAWN_ATTACKS[oppositeOfColor][square], bb.piece[color][Pawn]), () => attackers.push(Pawn));
 
     const rookQueenBB = or64(bb.piece[color][Rook], bb.piece[color][Queen]);
-    forEachBit(and64(rookAttacks(square, bb.all), rookQueenBB), (sq) => attackers.push(boardPos[sq].type));
+    forEachBit(and64(rookAttacks(square, bb.all), rookQueenBB), (sq) => attackers.push(((boardPos[sq]) & 7)));
 
     const bishopQueenBB = or64(bb.piece[color][Bishop], bb.piece[color][Queen]);
-    forEachBit(and64(bishopAttacks(square, bb.all), bishopQueenBB), (sq) => attackers.push(boardPos[sq].type));
+    forEachBit(and64(bishopAttacks(square, bb.all), bishopQueenBB), (sq) => attackers.push(((boardPos[sq]) & 7)));
 
     return attackers;
 }
@@ -938,7 +1368,7 @@ function getAttackers(boardPos, square, color) {
 // captures in quiescence that lose material outright.
 function seeCapture(boardPos, move) {
     const square = move.posTo;
-    const attackerColor = move.piece.color;
+    const attackerColor = ((move.piece) & 24);
     const defenderColor = attackerColor === White ? Black : White;
 
     // Check the defender's pool first: if nothing recaptures at all, the
@@ -946,11 +1376,11 @@ function seeCapture(boardPos, move) {
     // captured piece's value -- skip computing our own attacker pool
     // entirely (a whole second getAttackers scan + sort) since it would
     // never be consulted anyway (most callers already skip this call
-    // altogether via the same attackedPos check, see sortMoves -- this is a
-    // defensive fast path for any other caller).
+    // altogether via the same defenderType check, see sortMoves -- this is
+    // a defensive fast path for any other caller).
     const theirPool = getAttackers(boardPos, square, defenderColor).map(pieceValue).sort((a, b) => a - b);
     if (theirPool.length === 0) {
-        return pieceValue(move.attPiece.type);
+        return pieceValue(((move.attPiece) & 7));
     }
 
     // getAttackers is queried against the board BEFORE the move, where the
@@ -960,11 +1390,11 @@ function seeCapture(boardPos, move) {
     // now sitting ON the square as occupantValue below), so drop one
     // matching entry before treating the rest as our later recapture pool.
     const ourPool = getAttackers(boardPos, square, attackerColor).map(pieceValue).sort((a, b) => a - b);
-    const moverIdx = ourPool.indexOf(pieceValue(move.piece.type));
+    const moverIdx = ourPool.indexOf(pieceValue(((move.piece) & 7)));
     if (moverIdx !== -1) ourPool.splice(moverIdx, 1);
 
-    const gain = [pieceValue(move.attPiece.type)];
-    let occupantValue = pieceValue(move.piece.type);
+    const gain = [pieceValue(((move.attPiece) & 7))];
+    let occupantValue = pieceValue(((move.piece) & 7));
     let pools = [theirPool, ourPool];
     let turn = 0; // 0 = defender's turn to recapture next, 1 = attacker's turn after that
 
@@ -981,13 +1411,22 @@ function seeCapture(boardPos, move) {
     return gain[0];
 }
 
-function sortMoves(moveList, attackedPos, depth, boardPos) {
+function sortMoves(moveList, boardPos, defenderColor, depth) {
     const killers = depth != null && depth < MAX_KILLER_DEPTH ? killerMoves[depth] : null;
     for (let i = 0; i < moveList.length; i++) {
         const move = moveList[i];
         let moveScoreGuess = 0;
-        const movePieceType = move.piece.type;
-        const attPieceType = move.attPiece.type;
+        const movePieceType = ((move.piece) & 7);
+        const attPieceType = ((move.attPiece) & 7);
+        // Per-move query (a small, bounded per-square scan) instead of a
+        // precomputed whole-board attack map: profiling showed the old
+        // getAttackedPosition-based version -- one O(64) full-board scan
+        // per node, reused across all of that node's moves -- cost more
+        // than just asking squareAttackerType once per move directly. A
+        // typical node has far fewer moves than 64 squares, and unlike
+        // getAttackedPosition this does no whole-board work and allocates
+        // nothing.
+        const defenderType = boardPos ? squareAttackerType(boardPos, move.posTo, defenderColor) : None;
 
         if (attPieceType != None) {
             // SEE accounts for defenders, unlike plain MVV-LVA — a capture
@@ -995,10 +1434,8 @@ function sortMoves(moveList, attackedPos, depth, boardPos) {
             // instead of ahead of them.
             if (!boardPos) {
                 moveScoreGuess = 10 * pieceValue(attPieceType) - pieceValue(movePieceType);
-            } else if (attackedPos[move.posTo] == None) {
-                // attackedPos is already the defending side's full attack
-                // map for this node (computed once, not per move) -- if it
-                // shows no defender at all on the destination square, SEE's
+            } else if (defenderType === None) {
+                // No defender at all on the destination square -- SEE's
                 // exchange sequence would trivially resolve to just the
                 // captured piece's value with nothing left to recapture
                 // with. Skip the whole SEE computation (two getAttackers
@@ -1022,7 +1459,7 @@ function sortMoves(moveList, attackedPos, depth, boardPos) {
             moveScoreGuess += pieceValue(move.promotedTo);
         }
 
-        if (attackedPos[move.posTo] == Pawn) {
+        if (defenderType === Pawn) {
             moveScoreGuess -= pieceValue(movePieceType);
         }
 
@@ -1064,8 +1501,8 @@ function playAi() {
         let newBoardPos = moveToBoard(move, boardPosition);
         let lm = move;
         let val;
-        if (move.piece.type == King) {
-            if (move.piece.color == Black) {
+        if (((move.piece) & 7) == King) {
+            if (((move.piece) & 24) == Black) {
                 val = -Search(depth, WTM, newBoardPos, lm, WhiteKingPos, move.posTo, -999999, 999999);
             } else {
                 val = -Search(depth, WTM, newBoardPos, lm, move.posTo, BlackKingPos, -999999, 999999);
@@ -1335,8 +1772,8 @@ function compileOpeningBook() {
             const candidates = openingBook.get(key);
             if (!candidates.some((c) => c.from === from && c.to === to)) candidates.push({ from, to });
 
-            if (match.piece.type === King) {
-                if (match.piece.color === Black) BKPos = match.posTo;
+            if (((match.piece) & 7) === King) {
+                if (((match.piece) & 24) === Black) BKPos = match.posTo;
                 else WKPos = match.posTo;
             }
             boardPos = moveToBoard(match, boardPos);
@@ -1373,12 +1810,13 @@ compileOpeningBook();
 // there's no "the answer looks settled, stop early" shortcut, since more
 // depth is never wasted.
 const AI_BASE_TIME_MS = 3000;
-const AI_MAX_TIME_MS = 6000;
+const AI_MAX_TIME_MS = 10000;
 const AI_EXTEND_MIN_DEPTH = 4; // don't react to instability before this -- shallow iterations are cheap and naturally noisy
 
 let lastSearchDepth = 0;
 let lastSearchScore = null; // null means "no real search yet" (e.g. a book move)
 let lastSearchTimeMs = 0;
+let lastSearchNodes = 0;
 
 // Updates the depth/eval/time readout in the UI (built in chess.js). Kept
 // here since it's driven entirely by playAi2's own search state.
@@ -1438,15 +1876,11 @@ function playAi2(options) {
     // at every node below — see updateHashForMove.
     const rootHash = computeHash(boardPosition, whiteToMove);
 
-    // Also invariant across depths when using a fixed subset: move
-    // *generation* (and the attacked-square map sortMoves needs) never
-    // changes mid-call, only move *ordering* does (see below) -- computed
-    // once here instead of every iteration.
-    let attackedPosForSubset = null;
-    if (usingSubset) {
-        const subsetColor = whiteToMove ? Black : White;
-        attackedPosForSubset = getAttackedPosition(boardPosition, subsetColor);
-    }
+    // Also invariant across depths when using a fixed subset: which color
+    // sortMoves needs to query for defenders never changes mid-call, only
+    // move *ordering* does (see below) -- computed once here instead of
+    // every iteration.
+    const subsetColor = usingSubset ? (whiteToMove ? Black : White) : null;
 
     let bestMove = null;
     let firstLegalMove = null;
@@ -1475,15 +1909,14 @@ function playAi2(options) {
             // order, quietly forfeiting depth. Move *generation* is what's
             // skippable here (already done once by the orchestrator), not
             // move *ordering*.
-            rootMoves = sortMoves(options.rootMoveSubset.slice(), attackedPosForSubset, null, boardPosition);
+            rootMoves = sortMoves(options.rootMoveSubset.slice(), boardPosition, subsetColor, null);
         } else {
             const color = whiteToMove ? Black : White;
-            const attackedPos = getAttackedPosition(boardPosition, color);
             rootMoves = sortMoves(
                 getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
-                attackedPos,
-                null,
-                boardPosition
+                boardPosition,
+                color,
+                null
             );
         }
         if (firstLegalMove === null && rootMoves.length > 0) firstLegalMove = rootMoves[0];
@@ -1531,19 +1964,19 @@ function playAi2(options) {
                 newBoardPos.__liveBB = syncBitboards(newBoardPos);
                 let childWKPos = WhiteKingPos;
                 let childBKPos = BlackKingPos;
-                if (move.piece.type === King) {
-                    if (move.piece.color === Black) childBKPos = move.posTo;
+                if (((move.piece) & 7) === King) {
+                    if (((move.piece) & 24) === Black) childBKPos = move.posTo;
                     else childWKPos = move.posTo;
                 }
                 const childHash = updateHashForMove(rootHash, move);
 
                 let val;
                 if (i === 0) {
-                    val = -Search(depth - 1, nextWTM, newBoardPos, move, childWKPos, childBKPos, -beta, -alpha, 0, childHash);
+                    val = -Search(depth - 1, nextWTM, newBoardPos, move, childWKPos, childBKPos, -beta, -alpha, 0, childHash, 1);
                 } else {
-                    val = -Search(depth - 1, nextWTM, newBoardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, 0, childHash);
+                    val = -Search(depth - 1, nextWTM, newBoardPos, move, childWKPos, childBKPos, -alpha - 1, -alpha, 0, childHash, 1);
                     if (!searchAborted && val > alpha && val < beta) {
-                        val = -Search(depth - 1, nextWTM, newBoardPos, move, childWKPos, childBKPos, -beta, -alpha, 0, childHash);
+                        val = -Search(depth - 1, nextWTM, newBoardPos, move, childWKPos, childBKPos, -beta, -alpha, 0, childHash, 1);
                     }
                 }
 
@@ -1616,7 +2049,12 @@ function playAi2(options) {
             previousScore = depthScore;
         }
         if (depthAborted) break;
-        if (depthScore !== null && depthScore > 900000) break; // forced mate found, no need to search deeper
+        // Forced mate found for the side to move -- deeper search on this
+        // depth's exhaustive root comparison already prefers the fastest
+        // mate available (MATE_SCORE decays by ply, see scoreToTT/Search
+        // above), so once one surfaces here it's already the quickest mate
+        // reachable within this depth; no need to search deeper.
+        if (depthScore !== null && depthScore > MATE_THRESHOLD) break;
         // "Nothing left to iterate on" only means the whole position is
         // forced when this loop sees ALL legal moves. With a subset, a
         // small rootMoves.length just means this worker got a small slice
@@ -1626,6 +2064,7 @@ function playAi2(options) {
         if (Date.now() >= searchDeadline) break;
     }
 
+    lastSearchNodes = asdsa;
     asdsa = 0;
     lastSearchTimeMs = Date.now() - searchStartTime;
     updateSearchInfo();
