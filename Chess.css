@@ -31,12 +31,48 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 12px;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+}
+
+.button-row button {
+    padding: 6px 12px;
+    font-size: 14px;
+}
+
+/* Sized to exactly the board+file-labels height (createBoard in chess.js:
+   600px board + 22px file-label row = 622px), so the sidebar bottoms out
+   flush with the board instead of running taller than it. Every child below
+   is flex-shrink: 0 (its natural content height) except .move-history,
+   which is the one that grows/shrinks to soak up whatever's left. */
+.move-history-column {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 220px;
+    height: 622px;
+}
+
+/* Fixed at exactly 2 lines' worth of height (2 * 1.5 line-height + the
+   8px top/bottom padding, box-sizing: border-box) -- height, not
+   min-height, so it never grows or shrinks with content. */
+.engine-live-info {
+    box-sizing: border-box;
+    height: 54px;
+    background: #2f2e2b;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: sans-serif;
+    font-size: 12.5px;
+    color: #8ecbff;
+    line-height: 1.5;
+    white-space: pre-line;
+    overflow: hidden;
+    flex-shrink: 0;
 }
 
 .move-history {
-    width: 220px;
-    height: 622px;
     background: #2f2e2b;
     border-radius: 6px;
     overflow-y: auto;
@@ -45,6 +81,28 @@ body {
     font-family: sans-serif;
     font-size: 14px;
     color: #ddd;
+    flex: 1 1 auto;
+    min-height: 0; /* lets it actually shrink within the flex column instead of overflowing past 622px total */
+}
+
+.sidebar-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: #ddd;
+    font-family: sans-serif;
+    font-size: 13px;
+    flex-shrink: 0;
+}
+
+.think-time-row input[type="number"] {
+    width: 48px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    border: none;
+    box-sizing: border-box;
+    font-size: 13px;
 }
 
 .move-history-row {

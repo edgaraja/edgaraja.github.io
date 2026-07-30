@@ -15,14 +15,37 @@ onmessage = function (e) {
     pieceCount = data.pieceCount;
     positionHistory = data.positionHistory;
 
-    // rootMoveSubset/deadline/hardDeadline are only present when this worker
-    // is part of a root-splitting pool (chess.js's requestAiMove); a plain
-    // single-worker dispatch omits them, giving playAi2() its original,
-    // unrestricted behavior.
-    const move = playAi2(
-        data.rootMoveSubset
-            ? { rootMoveSubset: data.rootMoveSubset, deadline: data.deadline, hardDeadline: data.hardDeadline }
-            : undefined
-    );
-    postMessage({ move, lastSearchDepth, lastSearchScore, lastSearchTimeMs, lastSearchUnstable, lastSearchNodes });
+    // Forwards each completed depth's result to the main thread as it
+    // happens (ai.js calls this once per iterative-deepening pass) -- gives
+    // chess.js's dispatchSearchRound a stream of "progress" messages ahead
+    // of the final one, tagged so it can tell the two apart. Cleared right
+    // after playAi2 returns so a stale closure from this call never fires
+    // during some later, unrelated dispatch to this same reused worker.
+    onSearchProgress = function (info) {
+        postMessage({
+            type: "progress",
+            depth: info.depth,
+            score: info.score,
+            move: info.move,
+            nodes: info.nodes,
+            timeMs: info.timeMs,
+        });
+    };
+
+    // rootMoveSubset is only present when this worker is part of a
+    // root-splitting pool (chess.js's requestAiMove) -- deadline/hardDeadline
+    // are sent independently of it, since the player-turn background-eval
+    // dispatch (chess.js's runBackgroundEval) sends its own 10-second budget
+    // WITHOUT a rootMoveSubset, to get playAi2's original full-move-list
+    // search capped at that budget instead of a pool slice's. Omitted
+    // fields just fall back to playAi2's own internal defaults, same as
+    // passing no options at all.
+    const move = playAi2({
+        rootMoveSubset: data.rootMoveSubset,
+        deadline: data.deadline,
+        hardDeadline: data.hardDeadline,
+        skipBook: data.skipBook,
+    });
+    onSearchProgress = null;
+    postMessage({ type: "done", move, lastSearchDepth, lastSearchScore, lastSearchTimeMs, lastSearchUnstable, lastSearchNodes });
 };

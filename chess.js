@@ -42,6 +42,7 @@ var undoButton = null;
 // always holds.
 var moveHistorySAN = [];
 var moveHistoryPanel = null;
+var engineLiveInfoPanel = null;
 // Pre-move state. premoveSelectedSquare/premoveCandidates are transient --
 // a piece has been picked during the AI's think time but no destination
 // confirmed yet. pendingPremove is the confirmed, queued move ({pos,
@@ -53,6 +54,7 @@ var premoveCandidates = [];
 var pendingPremove = null;
 var evalBarWhiteFill = null;
 var evalBarLabel = null;
+var evalBarWrapper = null;
 var boardFlipped = false;
 var rankLabelEls = [];
 var fileLabelEls = [];
@@ -68,6 +70,20 @@ let aiThinking = false;
 // aiWorkerPool is -- lets a specific worker's onerror reject only its own
 // in-flight request instead of guessing which request was in flight.
 let pendingAiRejects = [];
+// Latest "progress" message seen from each pool worker during the CURRENT
+// requestAiMove call, indexed the same way aiWorkerPool/pendingAiRejects
+// are. Reset at the start of every requestAiMove so a previous move's
+// stats never bleed into the next one's live readout.
+let latestSearchProgress = [];
+// Dedicated worker for the player-turn live-eval feature (runBackgroundEval
+// below) -- deliberately separate from aiWorkerPool so this purely
+// informational analysis, run only to keep the eval bar live while a human
+// is thinking, can never occupy a worker the AI's own real move search
+// needs. Only created for a human-vs-AI game (playAsWhite/playAsBlack);
+// AivsAi has no human turn to analyze during, so this stays null there and
+// every function below that touches it is a no-op.
+let backgroundEvalWorker = null;
+const BACKGROUND_EVAL_MAX_MS = 20000;
 
 const None = 0;
 const Pawn = 1;
@@ -250,6 +266,7 @@ function createEvalBar() {
 
     evalBarWhiteFill = whiteFill;
     evalBarLabel = label;
+    evalBarWrapper = wrapper;
 }
 
 // Maps a static eval (in pawns, White's perspective) to a white-share
@@ -1340,6 +1357,14 @@ function dispatchSearchRound(subsets, deadline, hardDeadline) {
             new Promise((resolve, reject) => {
                 pendingAiRejects[i] = reject;
                 worker.onmessage = function (e) {
+                    // A "progress" message is one of possibly several
+                    // per-depth ticks this worker sends before its actual
+                    // result -- forward it and keep waiting; only a "done"
+                    // message is the one this promise should resolve on.
+                    if (e.data.type === "progress") {
+                        handleWorkerProgress(i, e.data);
+                        return;
+                    }
                     pendingAiRejects[i] = null;
                     resolve(e.data);
                 };
@@ -1420,6 +1445,13 @@ function requestAiMove() {
     const deadline = requestStart + AI_BASE_TIME_MS;
     const hardDeadline = requestStart + AI_MAX_TIME_MS;
 
+    // Fresh live-readout state for this move -- otherwise the first tick
+    // to arrive would be merged against whichever workers' slots still held
+    // the PREVIOUS move's final ticks. The panel itself is left showing
+    // whatever it already had (the last move's stats, or "Engine idle")
+    // until the first real tick below overwrites it.
+    latestSearchProgress = [];
+
     // Each playAi2() call times itself from its OWN call-local
     // searchStartTime (ai.js), so a worker's reported lastSearchTimeMs only
     // ever reflects that one call's own duration -- for a round-2 dispatch,
@@ -1468,13 +1500,70 @@ async function playAiTurn() {
         updateSearchInfo();
         updateEvalBar(lastSearchScore);
         aiThinking = false;
+        // The final depth/eval/nodes this move reached is already covered by
+        // updateSearchInfo's own label just above -- go back to idle rather
+        // than leaving the live readout frozen on stats that no longer
+        // describe anything "live".
+        if (engineLiveInfoPanel) engineLiveInfoPanel.textContent = "Engine idle";
         if (result.move) {
             await movePiece(result.move);
         }
     } catch (err) {
         aiThinking = false;
+        if (engineLiveInfoPanel) engineLiveInfoPanel.textContent = "Engine idle";
         console.error("AI move request failed:", err);
     }
+}
+
+function isPlayerTurn() {
+    return (playAsW && whiteToMove) || (playAsB && !whiteToMove);
+}
+
+// Throws away whatever background-eval analysis is currently running (if
+// any) by terminating its worker and replacing it with a fresh one, rather
+// than trying to reuse it -- a worker can't be interrupted mid-search any
+// other way (playAi2 is one long synchronous call with no point where it
+// polls for a cancel signal), and this worker's only state (its
+// transposition table, killer moves) is cheap to lose given it's a
+// supplementary display feature, not the real move search. Called whenever
+// the position is about to change (movePiece, restoreSnapshot) so a
+// still-running analysis of the OLD position can never land a progress
+// tick after the board's already moved on.
+function cancelBackgroundEval() {
+    if (!backgroundEvalWorker) return;
+    backgroundEvalWorker.terminate();
+    backgroundEvalWorker = new Worker("ai-worker.js");
+}
+
+// Keeps the eval bar (and the sidebar's depth/nodes readout) live while a
+// human is thinking, capped at BACKGROUND_EVAL_MAX_MS -- deliberately run on
+// its own dedicated worker (backgroundEvalWorker, never aiWorkerPool) so it
+// can never delay the AI's own real move search, and deliberately never
+// surfacing the move it finds: renderBackgroundEvalProgress below only ever
+// reads depth/score/nodes off each tick, so the player can't see what the
+// engine would play before they've committed to their own move.
+function runBackgroundEval() {
+    if (!backgroundEvalWorker || !isPlayerTurn() || gameOver) return;
+    const deadline = Date.now() + BACKGROUND_EVAL_MAX_MS;
+    backgroundEvalWorker.onmessage = function (e) {
+        if (e.data.type === "progress") renderBackgroundEvalProgress(e.data);
+    };
+    backgroundEvalWorker.postMessage({
+        boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos, pieceCount, positionHistory,
+        deadline, hardDeadline: deadline,
+        // Skips the book-move shortcut (ai.js's playAi2) -- that shortcut
+        // returns instantly with no real search and no progress ticks,
+        // which would leave the eval bar/readout frozen for as long as the
+        // position stays in book. A real search is exactly what this
+        // dispatch exists for.
+        skipBook: true,
+    });
+}
+
+function renderBackgroundEvalProgress(data) {
+    updateEvalBar(data.score);
+    if (!engineLiveInfoPanel) return;
+    engineLiveInfoPanel.textContent = "Depth " + data.depth + "\n" + (data.nodes || 0).toLocaleString() + " nodes";
 }
 
 // Square name for SAN purposes -- deliberately not reusing the existing
@@ -1559,16 +1648,170 @@ function renderMoveHistory() {
     moveHistoryPanel.scrollTop = moveHistoryPanel.scrollHeight;
 }
 
+// Called with each pool worker's latest depth/eval/nodes/move tick as it
+// arrives (see dispatchSearchRound's onmessage branch below). Just records
+// it and re-renders -- cheap enough (a handful of ticks per second, at
+// most) to do on every message rather than throttling.
+function handleWorkerProgress(workerIndex, data) {
+    latestSearchProgress[workerIndex] = data;
+    renderEngineLiveInfo();
+}
+
+// Merges every pool worker's latest tick into one live readout. Root-
+// splitting (requestAiMove) means no single worker holds "the" line, only
+// whichever slice currently looks best for the side to move -- same
+// side-to-move-oriented comparison pickBestResult uses for final results,
+// just applied to in-progress ticks instead of finished searches. Node
+// counts, on the other hand, sum across the whole pool: every worker is
+// doing real work on its own slice of the root moves.
+function renderEngineLiveInfo() {
+    if (!engineLiveInfoPanel) return;
+    const ticks = latestSearchProgress.filter(Boolean);
+    if (ticks.length === 0) return;
+
+    let best = null;
+    let bestOriented = -Infinity;
+    let totalNodes = 0;
+    let maxDepth = 0;
+    for (const t of ticks) {
+        totalNodes += t.nodes || 0;
+        if (t.depth > maxDepth) maxDepth = t.depth;
+        if (!t.move) continue;
+        const oriented = whiteToMove ? t.score : -t.score;
+        if (best === null || oriented > bestOriented) {
+            best = t;
+            bestOriented = oriented;
+        }
+    }
+    if (!best) return;
+
+    // Drives the eval bar itself off the same in-progress tick, instead of
+    // only updating it once the whole search finishes (playAiTurn) -- the
+    // eval bar is now the sole place the score itself is shown, so the text
+    // readout below no longer repeats it.
+    updateEvalBar(best.score);
+
+    const pieceLetter = SAN_PIECE_LETTERS[(best.move.piece) & 7] || "";
+    const promoSuffix = best.move.isPromoted ? "=" + SAN_PIECE_LETTERS[(best.move.promotedTo) & 7] : "";
+    const moveStr = pieceLetter + sqName(best.move.pos) + "-" + sqName(best.move.posTo) + promoSuffix;
+    // Exactly 2 lines, matching .engine-live-info's fixed 2-line height --
+    // depth+move on the first, nodes on the second.
+    engineLiveInfoPanel.textContent = "Depth " + maxDepth + "  ·  " + moveStr + "\n" + totalNodes.toLocaleString() + " nodes";
+}
+
+function setEvalBarVisible(visible) {
+    if (!evalBarWrapper) return;
+    evalBarWrapper.style.display = visible ? "flex" : "none";
+}
+
+function createEvalBarToggle() {
+    const row = document.createElement("div");
+    row.className = "sidebar-setting-row";
+
+    const label = document.createElement("label");
+    label.textContent = "Show eval bar";
+    label.htmlFor = "evalBarToggle";
+    row.appendChild(label);
+
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.id = "evalBarToggle";
+    input.checked = true;
+    input.addEventListener("change", function () {
+        setEvalBarVisible(input.checked);
+    });
+    row.appendChild(input);
+
+    return row;
+}
+
+// Clamped to a sane range and kept as the caller's single knob -- rather
+// than exposing AI_BASE_TIME_MS/AI_MAX_TIME_MS as two separate controls,
+// this preserves their original 1:2 ratio (the "extend up to double when
+// unstable" behavior, ai.js) at whatever base the user picks.
+function setThinkTimeSeconds(seconds) {
+    const clamped = Math.max(1, Math.min(30, Math.round(seconds)));
+    AI_BASE_TIME_MS = clamped * 1000;
+    AI_MAX_TIME_MS = clamped * 2000;
+    return clamped;
+}
+
+function createThinkTimeControl() {
+    const row = document.createElement("div");
+    row.className = "sidebar-setting-row think-time-row";
+
+    const label = document.createElement("label");
+    label.textContent = "Think time (s)";
+    label.htmlFor = "thinkTimeInput";
+    row.appendChild(label);
+
+    const input = document.createElement("input");
+    input.type = "number";
+    input.id = "thinkTimeInput";
+    input.min = "1";
+    input.max = "30";
+    input.step = "1";
+    input.addEventListener("change", function () {
+        const seconds = parseInt(input.value, 10);
+        input.value = String(setThinkTimeSeconds(Number.isFinite(seconds) ? seconds : AI_BASE_TIME_MS / 1000));
+    });
+    row.appendChild(input);
+
+    // AI_BASE_TIME_MS lives in ai.js, which -- per every page's <script> tag
+    // order (chess.js, bitboard.js, ai.js, getcapture.js) -- hasn't loaded
+    // yet while chess.js's own top-level DOM setup (the `typeof document
+    // !== "undefined"` block below) is still running. Reading it directly
+    // here would throw a ReferenceError mid-setup, aborting everything after
+    // it in that block -- including the worker-pool creation loop just below
+    // -- exactly the same reason positionHistory's seeding at the bottom of
+    // this file already defers to the "load" event instead of reading
+    // computeHash's dependencies directly inline.
+    window.addEventListener("load", function () {
+        input.value = String(AI_BASE_TIME_MS / 1000);
+    });
+
+    return row;
+}
+
 function createMoveHistoryPanel() {
+    // Groups the live engine readout, move list, think-time control, and
+    // flip/undo buttons into one column to the board's right, sized to
+    // exactly the board's own height (see .move-history-column in
+    // Chess.css) -- rather than each being a loose sibling scattered across
+    // gameRow/container's own layout.
+    const column = document.createElement("div");
+    column.className = "move-history-column";
+    gameRow.appendChild(column);
+
+    const liveInfo = document.createElement("div");
+    liveInfo.className = "engine-live-info";
+    liveInfo.textContent = "Engine idle";
+    column.appendChild(liveInfo);
+    engineLiveInfoPanel = liveInfo;
+
     const panel = document.createElement("div");
     panel.className = "move-history";
-    gameRow.appendChild(panel);
+    column.appendChild(panel);
     moveHistoryPanel = panel;
     renderMoveHistory();
+
+    column.appendChild(createEvalBarToggle());
+    column.appendChild(createThinkTimeControl());
+    // buttonRow already exists (created just before this function is
+    // called) and picks up whichever buttons createFlipButton/
+    // createUndoButton have added to it so far or add to it later --
+    // moving it here, instead of appending it to #container, is what puts
+    // Flip Board/Undo in this sidebar instead of their own full-width row.
+    column.appendChild(buttonRow);
 }
 
 async function movePiece(move) {
     if (gameOver) return;
+    // The position is about to change -- any background-eval analysis still
+    // running (see runBackgroundEval) is of a position that's a ply out of
+    // date the instant this returns, whether this call is applying the
+    // human's own move or the AI's reply.
+    cancelBackgroundEval();
     undoStack.push({
         boardPosition: boardPosition.slice(),
         whiteToMove: whiteToMove,
@@ -1708,6 +1951,12 @@ async function movePiece(move) {
         // CONFIRMED premove gets its real, only legality check here.
         clearPremoveSelectionHighlight();
         await tryFirePremove();
+        // Genuinely settled on the human's turn now (tryFirePremove either
+        // had nothing queued, or already recursed through movePiece for a
+        // queued one) -- safe to start keeping the eval bar live while they
+        // think. A no-op if this isn't actually a human-vs-AI game or the
+        // game just ended (isPlayerTurn/gameOver checks inside).
+        runBackgroundEval();
     }
     removeEventListener();
 }
@@ -1730,6 +1979,10 @@ function undoMove() {
 }
 
 function restoreSnapshot(snap) {
+    // The board is about to jump to a different position entirely -- same
+    // reasoning as movePiece's own call: any in-flight background eval is
+    // now analyzing a position that no longer exists.
+    cancelBackgroundEval();
     boardPosition = snap.boardPosition;
     whiteToMove = snap.whiteToMove;
     lastMove = snap.lastMove;
@@ -1765,6 +2018,11 @@ function restoreSnapshot(snap) {
         tile.classList.add(tile.getAttribute("tilecolor") == "dark" ? "darkClicked2" : "lightClicked2");
         tileTo.classList.add(tileTo.getAttribute("tilecolor") == "dark" ? "darkClicked2" : "lightClicked2");
     }
+
+    // Undo always lands back on the human's turn (see undoMove's own
+    // comment on why) -- safe to start keeping the eval bar live for the
+    // now-current position.
+    runBackgroundEval();
 }
 
 function showedMoveClicked(e) {
@@ -2203,6 +2461,11 @@ function getEval() {
 function playAsWhite() {
     playAsW = true;
     createUndoButton();
+    backgroundEvalWorker = new Worker("ai-worker.js");
+    // White (the player here) moves first -- no AI move precedes this turn
+    // for movePiece's own "genuinely the human's turn" branch to start
+    // background eval from, so it's kicked off directly here instead.
+    runBackgroundEval();
 }
 
 async function playAsBlack() {
@@ -2212,6 +2475,10 @@ async function playAsBlack() {
     // time that check runs.
     playAsB = true;
     createUndoButton();
+    backgroundEvalWorker = new Worker("ai-worker.js");
+    // No runBackgroundEval() call needed here -- once the AI's opening move
+    // below is applied, movePiece's own "genuinely the human's turn" branch
+    // starts it for Black's first move.
     await playAiTurn();
 }
 
@@ -2256,12 +2523,12 @@ if (typeof document !== "undefined") {
     gameRow.className = "game-row";
     container.appendChild(gameRow);
 
-    // Flip Board + Undo side by side in one row, instead of each stacking as
-    // its own full row below the board -- keeps the whole game area short
-    // enough to not need scrolling to reach the controls.
+    // Flip Board + Undo side by side in one row -- created here (before
+    // createMoveHistoryPanel needs to place it) but not appended anywhere
+    // yet; createMoveHistoryPanel appends it into the move-history sidebar
+    // instead of it floating as its own full-width row under the board.
     buttonRow = document.createElement("div");
     buttonRow.className = "button-row";
-    container.appendChild(buttonRow);
 
     createEvalBar();
     createBoard();

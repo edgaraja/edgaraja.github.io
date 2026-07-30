@@ -2018,8 +2018,14 @@ compileOpeningBook();
 // gets used otherwise — depth keeps increasing for as long as time allows,
 // there's no "the answer looks settled, stop early" shortcut, since more
 // depth is never wasted.
-const AI_BASE_TIME_MS = 3000;
-const AI_MAX_TIME_MS = 6000;
+// Mutable (not const): the on-page "Think time" control (chess.js's
+// setThinkTimeSeconds) reassigns both together, keeping AI_MAX_TIME_MS at
+// exactly double AI_BASE_TIME_MS -- the same ratio these started at -- so
+// the "extend up to double when the position looks unstable" behavior below
+// scales with whatever base the user picks instead of staying pinned to the
+// original 3000/6000 default.
+let AI_BASE_TIME_MS = 3000;
+let AI_MAX_TIME_MS = 6000;
 const AI_EXTEND_MIN_DEPTH = 4; // don't react to instability before this -- shallow iterations are cheap and naturally noisy
 
 let lastSearchDepth = 0;
@@ -2035,6 +2041,14 @@ let lastSearchNodes = 0;
 // `true` left over from a completely different earlier move must never leak
 // into a later, unrelated call.
 let lastSearchUnstable = false;
+
+// Optional per-depth progress callback, set by the caller (ai-worker.js)
+// before invoking playAi2 -- lets the worker forward live depth/eval/nodes/
+// best-move updates to the main thread as each iterative-deepening pass
+// completes. Stays null on the main thread (nothing there ever sets it), so
+// the call site below is always a no-op guard when playAi2 runs outside a
+// worker.
+let onSearchProgress = null;
 
 // Updates the depth/eval/time readout in the UI (built in chess.js). Kept
 // here since it's driven entirely by playAi2's own search state.
@@ -2059,13 +2073,19 @@ function updateSearchInfo() {
 // slice. Omitting `options` entirely (the only way this was ever called
 // before root-splitting existed) is byte-identical to the original
 // behavior: book-move check included, full move generation every depth.
+// `options.skipBook` bypasses just the book-move shortcut while still using
+// the full move list -- the player-turn background eval (chess.js's
+// runBackgroundEval) sets this, since a book move's whole point is to
+// return instantly with no real search or progress ticks at all (see the
+// early return right below), which would leave the eval bar/readout frozen
+// with nothing to show for as long as the position stays in book.
 function playAi2(options) {
     const searchStartTime = Date.now();
     options = options || {};
     const usingSubset = !!options.rootMoveSubset;
     lastSearchUnstable = false;
 
-    if (!usingSubset) {
+    if (!usingSubset && !options.skipBook) {
         const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
         if (bookMove) {
             lastSearchDepth = 0;
@@ -2284,6 +2304,16 @@ function playAi2(options) {
 
             previousBestMove = bestMove;
             previousScore = depthScore;
+
+            // Real-time progress: forwards this depth's result to the caller
+            // as soon as it's known, instead of only reporting once the whole
+            // search budget is spent. One call per completed depth -- a
+            // postMessage's structured-clone cost is trivial next to a search
+            // node, so this can't meaningfully slow the search down, and the
+            // recursive Search() hot path below is untouched.
+            if (onSearchProgress) {
+                onSearchProgress({ depth, score: lastSearchScore, move: bestMove, nodes: asdsa, timeMs: Date.now() - searchStartTime });
+            }
         }
         if (depthAborted) break;
         // Forced mate found for the side to move -- deeper search on this
