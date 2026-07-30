@@ -24,5 +24,5 @@ onmessage = function (e) {
             ? { rootMoveSubset: data.rootMoveSubset, deadline: data.deadline, hardDeadline: data.hardDeadline }
             : undefined
     );
-    postMessage({ move, lastSearchDepth, lastSearchScore, lastSearchTimeMs });
+    postMessage({ move, lastSearchDepth, lastSearchScore, lastSearchTimeMs, lastSearchUnstable, lastSearchNodes });
 };

@@ -369,6 +369,11 @@ function Evaluate(WTM, boardPos) {
     let blackBishops = 0;
     let whiteMaterial = 0;
     let blackMaterial = 0;
+    // Raw (untapered) low-mobility penalty totals, applied afterward once
+    // phase01 is known -- see the taper comment where they're consumed,
+    // below the main loop.
+    let whiteLowMobPenalty = 0;
+    let blackLowMobPenalty = 0;
 
     const whitePawnColsRows = Array.from({ length: 8 }, () => []);
     const blackPawnColsRows = Array.from({ length: 8 }, () => []);
@@ -408,14 +413,14 @@ function Evaluate(WTM, boardPos) {
                 const mob = slidingMobility(boardPos, i, Black, true) + slidingMobility(boardPos, i, Black, false);
                 evalBlack += 900 + queenMap[i] / 10;
                 evalBlack += mob;
-                evalBlack -= lowMobilityPenalty(mob, 9);
+                blackLowMobPenalty += lowMobilityPenalty(mob, 9);
                 phaseAccum += PHASE_QUEEN;
                 blackMaterial += 9;
             } else if (((p) & 7) == Rook) {
                 const mob = slidingMobility(boardPos, i, Black, false);
                 evalBlack += 500;
                 evalBlack += 2 * mob;
-                evalBlack -= lowMobilityPenalty(mob, 5);
+                blackLowMobPenalty += lowMobilityPenalty(mob, 5);
                 blackRookSquares.push(i);
                 phaseAccum += PHASE_ROOK;
                 blackMaterial += 5;
@@ -423,14 +428,14 @@ function Evaluate(WTM, boardPos) {
                 const mob = knightMobility(boardPos, i, Black);
                 evalBlack += 300 + knightMap[i] / 10;
                 evalBlack += 2 * mob;
-                evalBlack -= lowMobilityPenalty(mob, 3);
+                blackLowMobPenalty += lowMobilityPenalty(mob, 3);
                 phaseAccum += PHASE_KNIGHT;
                 blackMaterial += 3;
             } else if (((p) & 7) == Bishop) {
                 const mob = slidingMobility(boardPos, i, Black, true);
                 evalBlack += 300 + bishopMap[i] / 10;
                 evalBlack += 2 * mob;
-                evalBlack -= lowMobilityPenalty(mob, 3);
+                blackLowMobPenalty += lowMobilityPenalty(mob, 3);
                 blackBishops++;
                 blackBishopSquares.push(i);
                 phaseAccum += PHASE_BISHOP;
@@ -449,14 +454,14 @@ function Evaluate(WTM, boardPos) {
                 const mob = slidingMobility(boardPos, i, White, true) + slidingMobility(boardPos, i, White, false);
                 evalWhite += 900 + queenMap[mirrorRank(i)] / 10;
                 evalWhite += mob;
-                evalWhite -= lowMobilityPenalty(mob, 9);
+                whiteLowMobPenalty += lowMobilityPenalty(mob, 9);
                 phaseAccum += PHASE_QUEEN;
                 whiteMaterial += 9;
             } else if (((p) & 7) == Rook) {
                 const mob = slidingMobility(boardPos, i, White, false);
                 evalWhite += 500;
                 evalWhite += 2 * mob;
-                evalWhite -= lowMobilityPenalty(mob, 5);
+                whiteLowMobPenalty += lowMobilityPenalty(mob, 5);
                 whiteRookSquares.push(i);
                 phaseAccum += PHASE_ROOK;
                 whiteMaterial += 5;
@@ -464,14 +469,14 @@ function Evaluate(WTM, boardPos) {
                 const mob = knightMobility(boardPos, i, White);
                 evalWhite += 300 + knightMap[mirrorRank(i)] / 10;
                 evalWhite += 2 * mob;
-                evalWhite -= lowMobilityPenalty(mob, 3);
+                whiteLowMobPenalty += lowMobilityPenalty(mob, 3);
                 phaseAccum += PHASE_KNIGHT;
                 whiteMaterial += 3;
             } else if (((p) & 7) == Bishop) {
                 const mob = slidingMobility(boardPos, i, White, true);
                 evalWhite += 300 + bishopMap[mirrorRank(i)] / 10;
                 evalWhite += 2 * mob;
-                evalWhite -= lowMobilityPenalty(mob, 3);
+                whiteLowMobPenalty += lowMobilityPenalty(mob, 3);
                 whiteBishops++;
                 whiteBishopSquares.push(i);
                 phaseAccum += PHASE_BISHOP;
@@ -487,6 +492,30 @@ function Evaluate(WTM, boardPos) {
     }
 
     const phase01 = Math.min(1, phaseAccum / PHASE_MAX);
+
+    // Low-mobility penalty, tapered by game phase: a piece boxed in with
+    // almost nowhere to go is completely normal in the opening (nothing has
+    // developed yet -- a rook fresh off castling is ALWAYS going to read as
+    // "low mobility" for a few moves, since it's boxed in by its own king
+    // and back-rank pieces, not because it's in any danger) and only
+    // becomes a genuinely meaningful "this piece might get trapped" signal
+    // later in the game, once both sides have had time to develop and a
+    // piece that's STILL stuck is more likely stuck for a real reason.
+    // Scaled by (1-phase01) -- zero weight at phase01's max (full opening
+    // material still on the board), full weight at phase01's min (bare
+    // endgame) -- the same phase01-driven taper idiom already used
+    // elsewhere in this function (pawn/rook/king PST, bad-bishop), just
+    // applied in the opposite direction from bad-bishop's (that penalty
+    // gets WEAKER toward the endgame; this one gets STRONGER, since a
+    // blocked bishop's problem eases as pawns come off, while a piece
+    // that's still nearly immobile late in the game is more likely a real
+    // problem, not a decreasing one). Verified against a real game: this
+    // was directly responsible for the engine judging a fresh-off-castling
+    // rook's temporarily low mobility as worse than the king safety/PST
+    // benefit castling itself provides, making the search prefer a
+    // rights-forfeiting manual king step over actually castling.
+    evalWhite -= whiteLowMobPenalty * (1 - phase01);
+    evalBlack -= blackLowMobPenalty * (1 - phase01);
 
     for (const sq of whitePawnSquares) {
         const m = mirrorRank(sq);
@@ -573,6 +602,181 @@ function Evaluate(WTM, boardPos) {
         return eval * -1;
     }
 }
+
+// --- Incremental material+PST+phase eval (quickEvaluate) ---
+// A cheap O(1)-to-read alternative to Evaluate(), used ONLY where a rough
+// "roughly ahead or behind" signal drives a pruning decision (RFP/futility's
+// staticEval, the repetition-contempt calc) rather than the accurate leaf
+// judgment quiescence's stand-pat needs. Mobility, hanging-piece detection,
+// and pawn structure all depend on the WHOLE board's shape (a rook leaving
+// a file can change a bishop's mobility; a captured pawn can make a
+// completely different pawn newly "passed") so they don't reduce to a cheap
+// per-mover delta the way material+PST does -- this only tracks the part of
+// Evaluate() that's purely per-piece, maintained incrementally through
+// chess.js's makeMove/unmakeMove (via the onMakeMove/onUnmakeMove hooks
+// those functions call, same optional-dependency pattern as
+// invalidateBitboardCache), the same way __liveBB and the Zobrist hash are
+// already maintained incrementally instead of rebuilt from scratch.
+//
+// Tapering wrinkle: pawn/rook/king PST blends middlegame/endgame tables via
+// phase01, which depends on which pieces are STILL ON THE BOARD -- so a
+// capture elsewhere can shift an untouched pawn's effective PST value. Fix:
+// track the UNBLENDED mg-table sum and eg-table sum separately per side
+// (each purely additive, zero cross-piece dependency) and blend only at
+// read time using whatever phase01 is current -- this reproduces Evaluate()
+// 's tapering with zero approximation error (material and the untapered
+// knight/bishop/queen PST get the identical value in both sums, so blending
+// them is a no-op).
+
+// Per-(piece,square) contribution to the running mg/eg sums, mirroring
+// Evaluate()'s own per-piece formulas exactly (material constants, the PST
+// tables, mirrorRank for White vs direct-index for Black, and the
+// PHASE_* phase-weight constants) -- this is the ONE place that must stay
+// in lockstep with Evaluate() for quickEvaluate() to agree with it whenever
+// material+PST+phase are all that's being compared. `sign` is +1 when the
+// piece is entering `sq`, -1 when leaving it.
+function pstDelta(pieceByte, sq, sign, liveEval) {
+    const type = (pieceByte) & 7;
+    if (type === None) return;
+    const isWhite = ((pieceByte) & 24) === White;
+    const idx = isWhite ? mirrorRank(sq) : sq;
+    const mgKey = isWhite ? "mgWhite" : "mgBlack";
+    const egKey = isWhite ? "egWhite" : "egBlack";
+    if (type === Queen) {
+        const v = 900 + queenMap[idx] / 10;
+        liveEval[mgKey] += sign * v;
+        liveEval[egKey] += sign * v;
+        liveEval.phaseAccum += sign * PHASE_QUEEN;
+    } else if (type === Rook) {
+        liveEval[mgKey] += sign * (500 + rookMap[idx] / 10);
+        liveEval[egKey] += sign * (500 + rookMapEnd[idx] / 10);
+        liveEval.phaseAccum += sign * PHASE_ROOK;
+    } else if (type === Knight) {
+        const v = 300 + knightMap[idx] / 10;
+        liveEval[mgKey] += sign * v;
+        liveEval[egKey] += sign * v;
+        liveEval.phaseAccum += sign * PHASE_KNIGHT;
+    } else if (type === Bishop) {
+        const v = 300 + bishopMap[idx] / 10;
+        liveEval[mgKey] += sign * v;
+        liveEval[egKey] += sign * v;
+        liveEval.phaseAccum += sign * PHASE_BISHOP;
+    } else if (type === Pawn) {
+        liveEval[mgKey] += sign * (100 + pawnMap[idx] / 10);
+        liveEval[egKey] += sign * (100 + pawnMapEnd[idx] / 10);
+    } else if (type === King) {
+        liveEval[mgKey] += sign * (kingMapMiddle[idx] / 10);
+        liveEval[egKey] += sign * (kingMapEnd[idx] / 10);
+    }
+}
+
+// From-scratch initializer -- analogous to bitboard.js's
+// rebuildBitboardsFromScratch. Only ever needed once per root-move subtree
+// (see the __liveEval init next to __liveBB in playAi2 below); every node
+// beneath that point maintains it incrementally via onMakeMove/onUnmakeMove.
+function computeLiveEval(boardPos) {
+    const liveEval = { mgWhite: 0, egWhite: 0, mgBlack: 0, egBlack: 0, phaseAccum: 0 };
+    for (let i = 0; i < 64; i++) {
+        pstDelta(boardPos[i], i, 1, liveEval);
+    }
+    return liveEval;
+}
+
+// Set to true only by test harnesses -- mirrors bitboard.js's
+// DEBUG_VERIFY_BITBOARDS. Verified at UPDATE time (inside onMakeMove) rather
+// than read time, so a drift throws immediately at the exact move that
+// caused it instead of only surfacing later, whenever quickEvaluate()
+// happens to be called next.
+let DEBUG_VERIFY_LIVE_EVAL = false;
+function verifyLiveEval(boardPos) {
+    const live = boardPos.__liveEval;
+    const truth = computeLiveEval(boardPos);
+    const EPS = 1e-9;
+    for (const key of ["mgWhite", "egWhite", "mgBlack", "egBlack", "phaseAccum"]) {
+        if (Math.abs(live[key] - truth[key]) > EPS) {
+            throw new Error(`__liveEval drift: ${key} live=${live[key]} truth=${truth[key]}`);
+        }
+    }
+}
+
+// Pooled undo snapshots, indexed by chess.js's makeMoveStackDepth (a plain
+// top-level `let` in chess.js, readable here as a bare identifier the same
+// way ai.js already reads pieceCount/positionHistory/etc -- same-realm
+// script scope, not window.-prefixed). Snapshotting the OLD totals (rather
+// than computing an inverse delta) means onUnmakeMove restores by plain
+// assignment, with zero drift risk, exactly matching how chess.js's own
+// unmakeMove restores mailbox squares by snapshot rather than by undoing
+// the move.
+const liveEvalPool = [];
+function getLiveEvalSlot(idx) {
+    while (liveEvalPool.length <= idx) {
+        liveEvalPool.push({ mgWhite: 0, egWhite: 0, mgBlack: 0, egBlack: 0, phaseAccum: 0 });
+    }
+    return liveEvalPool[idx];
+}
+
+// Called by chess.js's makeMove (see the guarded hook there) right after it
+// finishes mutating the board/bitboards. Mirrors moveToBoard/makeMove's own
+// 4-way dispatch (normal / en passant / castle / promotion), driven by the
+// same move fields those functions already trust, rather than re-deriving
+// anything from the board.
+function onMakeMove(board, move) {
+    const liveEval = board.__liveEval;
+    const slot = getLiveEvalSlot(makeMoveStackDepth - 1);
+    slot.mgWhite = liveEval.mgWhite;
+    slot.egWhite = liveEval.egWhite;
+    slot.mgBlack = liveEval.mgBlack;
+    slot.egBlack = liveEval.egBlack;
+    slot.phaseAccum = liveEval.phaseAccum;
+
+    if (move.isCastle) {
+        pstDelta(move.piece, move.pos, -1, liveEval);
+        pstDelta(move.piece, move.posTo, 1, liveEval);
+        const rookFrom = move.castleType === "l" ? move.posTo - 2 : move.posTo + 1;
+        const rookTo = move.castleType === "l" ? move.posTo + 1 : move.posTo - 1;
+        const rookPiece = ((move.piece) & 24) | Rook;
+        pstDelta(rookPiece, rookFrom, -1, liveEval);
+        pstDelta(rookPiece, rookTo, 1, liveEval);
+    } else if (move.isEnp) {
+        pstDelta(move.piece, move.pos, -1, liveEval);
+        pstDelta(move.piece, move.posTo, 1, liveEval);
+        pstDelta(move.attPiece, move.enpTo, -1, liveEval);
+    } else if (move.isPromoted) {
+        pstDelta(move.piece, move.pos, -1, liveEval);
+        if (((move.attPiece) & 7) !== None) pstDelta(move.attPiece, move.posTo, -1, liveEval);
+        pstDelta(move.promotedTo, move.posTo, 1, liveEval);
+    } else {
+        pstDelta(move.piece, move.pos, -1, liveEval);
+        if (((move.attPiece) & 7) !== None) pstDelta(move.attPiece, move.posTo, -1, liveEval);
+        pstDelta(move.piece, move.posTo, 1, liveEval);
+    }
+
+    if (DEBUG_VERIFY_LIVE_EVAL) verifyLiveEval(board);
+}
+
+// Called by chess.js's unmakeMove (see the guarded hook there), before it
+// decrements makeMoveStackDepth -- so this index still matches the one
+// onMakeMove used for this same move.
+function onUnmakeMove(board) {
+    const liveEval = board.__liveEval;
+    const slot = liveEvalPool[makeMoveStackDepth - 1];
+    liveEval.mgWhite = slot.mgWhite;
+    liveEval.egWhite = slot.egWhite;
+    liveEval.mgBlack = slot.mgBlack;
+    liveEval.egBlack = slot.egBlack;
+    liveEval.phaseAccum = slot.phaseAccum;
+}
+
+// The actual payoff: O(1), no board scan at all.
+function quickEvaluate(WTM, boardPos) {
+    const le = boardPos.__liveEval;
+    const phase01 = Math.min(1, le.phaseAccum / PHASE_MAX);
+    const evalScore = ((le.mgWhite * phase01 + le.egWhite * (1 - phase01))
+                     - (le.mgBlack * phase01 + le.egBlack * (1 - phase01))) / 100;
+    return WTM ? evalScore : -evalScore;
+}
+// --- End incremental material+PST+phase eval ---
+
 // --- Transposition Table ---
 const TT_EXACT = 0;
 const TT_ALPHA = 1; // upper bound (failed low)
@@ -833,7 +1037,7 @@ function Search(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, extensionsU
         // any other move), the side behind sees it as slightly positive
         // (so it's willing to seek it out). A position with genuinely no
         // better option still ends up drawn — this only breaks ties.
-        const staticEval = Evaluate(WTM, boardPos);
+        const staticEval = quickEvaluate(WTM, boardPos);
         const contempt = Math.max(-0.5, Math.min(0.5, staticEval * 0.15));
         return -contempt;
     }
@@ -929,7 +1133,7 @@ function SearchNode(depth, WTM, boardPos, lm, WKPos, BKPos, alpha, beta, hash, e
     const PRUNING_MAX_DEPTH = 3;
     const canPruneByEval = !inCheck && depth <= PRUNING_MAX_DEPTH && pieceCount > 6 &&
         Math.abs(beta) < MATE_THRESHOLD && Math.abs(alpha) < MATE_THRESHOLD;
-    const staticEval = canPruneByEval ? Evaluate(WTM, boardPos) : null;
+    const staticEval = canPruneByEval ? quickEvaluate(WTM, boardPos) : null;
 
     // Reverse futility pruning (a.k.a. static null-move pruning): if the
     // position already looks this good from a plain static eval, well
@@ -1540,8 +1744,8 @@ const openingBookLines = [
     // =========================================================
 
     // --- Ruy Lopez (Spanish) ---
-    "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6",          // Ruy Lopez, Closed / Morphy Defense
-    "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 e8g8 c2c3 d7d5", // Ruy Lopez, Marshall Attack
+    "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8 h2h3 c6a5 b3c2 c7c5 d2d4 d8c7", // Ruy Lopez, Closed, Chigorin Variation
+    "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 e8g8 c2c3 d7d5 e4d5 f6d5 f3e5 c6e5 e1e5 c7c6 d2d4 e7d6 e5e1 d8h4 g2g3 h4h3", // Ruy Lopez, Marshall Attack, main line
     "e2e4 e7e5 g1f3 b8c6 f1b5 g8f6 e1g1 f6e4 d2d4 e4d6 b5c6 d7c6 d4e5 d6f5 d1d8 e8d8", // Ruy Lopez, Berlin Defense (endgame)
     "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5c6 d7c6 e1g1 f7f6",                              // Ruy Lopez, Exchange Variation
     "e2e4 e7e5 g1f3 b8c6 f1b5 d7d6 d2d4 c8d7",                                        // Ruy Lopez, Steinitz Defense
@@ -1598,13 +1802,13 @@ const openingBookLines = [
     // =========================================================
 
     "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6",                              // Najdorf Variation
-    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6 f2f3 e7e5",                     // Najdorf, English Attack
-    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 g7g6",                              // Dragon Variation
-    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 g7g6 c1e3 f8g7 f2f3 e8g8 d1d2",     // Dragon, Yugoslav Attack
-    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 g7g6 f1e2",                          // Dragon, quiet setups
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6 f2f3 e7e5 d4b3 f8e7 c1e3 e8g8 d1d2 b8d7 e1c1", // Najdorf, English Attack, main tabiya
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 b8c6 c1e3 g7g6",                              // Dragon Variation
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 b8c6 c1e3 g7g6 f2f3 f8g7 d1d2 e8g8 e1c1 d6d5", // Dragon, Yugoslav Attack, main line (9...d5)
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 b8c6 f1e2 g7g6",                              // Dragon, quiet setups
     "e2e4 c7c5 g1f3 b8c6 d2d4 c5d4 f3d4 g8f6 b1c3 e7e6",                              // Classical Sicilian, Scheveningen-like
     "e2e4 c7c5 g1f3 e7e6 d2d4 c5d4 f3d4 g8f6 b1c3 d7d6",                              // Scheveningen Variation
-    "e2e4 c7c5 g1f3 e7e6 d2d4 c5d4 f3d4 b8c6 b1c3 d8c7",                              // Taimanov Variation
+    "e2e4 c7c5 g1f3 e7e6 d2d4 c5d4 f3d4 b8c6 b1c3 d8c7 f1e2 g8f6 e1g1 f8b4",           // Taimanov Variation, main line
     "e2e4 c7c5 g1f3 e7e6 d2d4 c5d4 f3d4 a7a6",                                        // Kan Variation
     "e2e4 c7c5 g1f3 b8c6 d2d4 c5d4 f3d4 g8f6 b1c3 e7e5",                              // Sveshnikov Variation
     "e2e4 c7c5 g1f3 b8c6 d2d4 c5d4 f3d4 e7e5",                                        // Kalashnikov Variation
@@ -1637,13 +1841,14 @@ const openingBookLines = [
     // 4. e4 c6 — Caro-Kann Defense
     // =========================================================
 
-    "e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4 c8f5 e4g3 f5g6 h2h4 h7h6",                    // Classical Variation
+    "e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4 c8f5 e4g3 f5g6 h2h4 h7h6 g1f3 b8d7 h4h5 g6h7 f1d3 h7d3 d1d3", // Classical Variation, main line
     "e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4 b8d7",                                        // Karpov Variation
     "e2e4 c7c6 d2d4 d7d5 e4e5 c8f5 g1f3 e7e6 f1e2 c6c5",                              // Advance Variation
     "e2e4 c7c6 d2d4 d7d5 e4d5 c6d5 c2c4",                                             // Panov-Botvinnik Attack
     "e2e4 c7c6 d2d4 d7d5 e4d5 c6d5 f1d3",                                             // Exchange Variation
     "e2e4 c7c6 b1c3 d7d5 g1f3 c8g4",                                                  // Two Knights Variation
     "e2e4 c7c6 d2d4 d7d5 b1d2 d5e4 d2e4 g8f6",                                        // Modern Variation (Smyslov/Bronstein order)
+    "e2e4 c7c6 d2d4 d7d5 f2f3 d5e4 f3e4 e7e5",                                        // Fantasy Variation
 
     // =========================================================
     // 5. e4 d5 — Scandinavian Defense
@@ -1675,12 +1880,13 @@ const openingBookLines = [
     // 8. d4 d5 — Queen's Gambit & Slav complexes
     // =========================================================
 
-    "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7",                    // QGD, Orthodox
+    "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 b8d7 a1c1 c7c6 f1d3 d5c4 d3c4 f6d5", // QGD, Orthodox, main line (Capablanca freeing maneuver)
     "d2d4 d7d5 c2c4 e7e6 c4d5 e6d5 b1c3 b8c6 g1f3 g8f6",                              // QGD, Exchange Variation
+    "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 g1f3 c7c5 c4d5 f6d5 e2e4 d5c3 b2c3 c5d4 c3d4",     // Semi-Tarrasch Defense
     "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 b8d7 e2e3 c7c6 g1f3 d8a5",                    // QGD, Cambridge Springs
     "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 h7h6 g5h4 b7b6",           // QGD, Tartakower Variation
     "d2d4 d7d5 c2c4 d5c4 g1f3 g8f6 e2e3 e7e6 f1c4 c7c5",                              // Queen's Gambit Accepted
-    "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 d5c4 a2a4 c8f5",                              // Slav Defense, main
+    "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 d5c4 a2a4 c8f5 e2e3 e7e6 f1c4 f8b4 e1g1 e8g8", // Slav Defense, main line
     "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 e7e6 e2e3 b8d7 f1d3 d5c4 d3c4 b7b5",           // Semi-Slav, Meran Variation
     "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 e7e6 c1g5 h7h6",                              // Semi-Slav, Botvinnik/Anti-Meran
     "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 a7a6",                                        // Chebanenko Slav
@@ -1694,17 +1900,19 @@ const openingBookLines = [
     // 9. d4 Nf6 — Indian Defenses
     // =========================================================
 
-    "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 g1f3 e8g8 f1e2 e7e5",                    // King's Indian, Classical
+    "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 g1f3 e8g8 f1e2 e7e5 e1g1 b8c6 d4d5 c6e7 f3e1 f6d7 e1d3 f7f5", // King's Indian, Classical, Mar del Plata
     "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 f2f3 e8g8 c1e3",                          // King's Indian, Sämisch
     "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 f2f4",                                    // King's Indian, Four Pawns Attack
     "d2d4 g8f6 c2c4 g7g6 g1f3 f8g7 g2g3 e8g8 f1g2 d7d6",                              // King's Indian, Fianchetto
-    "d2d4 g8f6 c2c4 g7g6 b1c3 d7d5 c4d5 f6d5 e2e4 d5c3 b2c3 f8g7",                     // Grünfeld, Exchange Variation
+    "d2d4 g8f6 c2c4 g7g6 b1c3 d7d5 c4d5 f6d5 e2e4 d5c3 b2c3 f8g7 f1c4 c7c5 g1e2 b8c6 c1e3", // Grünfeld, Exchange Variation, Classical main line
     "d2d4 g8f6 c2c4 g7g6 b1c3 d7d5 d1b3",                                             // Grünfeld, Russian System
     "d2d4 g8f6 c2c4 g7g6 g1f3 f8g7 g2g3 d7d5",                                        // Grünfeld, Fianchetto
-    "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 d1c2 e8g8 a2a3 b4c3 c2c3",                          // Nimzo-Indian, Classical
+    "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 d1c2 e8g8 a2a3 b4c3 c2c3 b7b6 c1g5 c8b7",           // Nimzo-Indian, Classical, main line
     "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 e2e3 e8g8 f1d3 d7d5",                              // Nimzo-Indian, Rubinstein
     "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 a2a3 b4c3 b2c3 c7c5",                              // Nimzo-Indian, Sämisch
+    "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 g1f3 c7c5 g2g3",                                   // Nimzo-Indian, Kasparov/Fischer Variation
     "d2d4 g8f6 c2c4 e7e6 g1f3 b7b6 g2g3 c8b7 f1g2 f8e7",                              // Queen's Indian Defense
+    "d2d4 g8f6 c2c4 e7e6 g1f3 b7b6 b1c3 c8b7 a2a3",                                   // Queen's Indian, Petrosian System
     "d2d4 g8f6 c2c4 e7e6 g1f3 d7d5 g2g3 f8e7 f1g2 e8g8",                              // Catalan Opening
     "d2d4 g8f6 c2c4 e7e6 g1f3 f8b4 b1d2",                                             // Bogo-Indian Defense
     "d2d4 g8f6 c2c4 c7c5 d4d5 e7e6 b1c3 e6d5 c4d5 d7d6 e2e4 g7g6",                     // Modern Benoni
@@ -1720,6 +1928,7 @@ const openingBookLines = [
     // =========================================================
 
     "c2c4 c7c5 g1f3 g8f6 b1c3 b8c6 g2g3 g7g6 f1g2 f8g7",                              // English, Symmetrical
+    "c2c4 g8f6 b1c3 e7e6 g1f3 b7b6 g2g3 c8b7 f1g2 f8e7",                              // English, Hedgehog setup
     "c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 d7d5 c4d5 f6d5",                              // English, Reversed Sicilian
     "c2c4 g8f6 b1c3 e7e5 g1f3 b8c6 g2g3 d7d5",                                        // English, Four Knights
     "c2c4 g8f6 b1c3 e7e6 e2e4 d7d5",                                                  // English, Mikenas-Carls
@@ -1810,24 +2019,37 @@ compileOpeningBook();
 // there's no "the answer looks settled, stop early" shortcut, since more
 // depth is never wasted.
 const AI_BASE_TIME_MS = 3000;
-const AI_MAX_TIME_MS = 10000;
+const AI_MAX_TIME_MS = 6000;
 const AI_EXTEND_MIN_DEPTH = 4; // don't react to instability before this -- shallow iterations are cheap and naturally noisy
 
 let lastSearchDepth = 0;
 let lastSearchScore = null; // null means "no real search yet" (e.g. a book move)
 let lastSearchTimeMs = 0;
 let lastSearchNodes = 0;
+// Whether the most recently completed depth's root move changed or its
+// score dropped (see the per-depth update below) -- read by the orchestrator
+// (chess.js's requestAiMove) across every worker in the pool to decide
+// whether a second, longer search round is warranted. Reset unconditionally
+// at the top of every playAi2 call (see there) since this is a plain
+// module-level var in a worker that's reused for the whole game -- a stale
+// `true` left over from a completely different earlier move must never leak
+// into a later, unrelated call.
+let lastSearchUnstable = false;
 
 // Updates the depth/eval/time readout in the UI (built in chess.js). Kept
 // here since it's driven entirely by playAi2's own search state.
 function updateSearchInfo() {
     if (typeof searchInfoLabel === "undefined" || !searchInfoLabel) return;
     if (lastSearchScore === null) {
-        searchInfoLabel.textContent = "Book move  ·  " + lastSearchTimeMs + "ms";
+        // Covers both a real book move AND requestAiMove's one-legal-move
+        // shortcut (chess.js) -- both skip search entirely, so there's
+        // nothing more specific to report than "no search happened".
+        searchInfoLabel.textContent = "No search needed  ·  " + lastSearchTimeMs + "ms";
         return;
     }
     const display = lastSearchScore >= 0 ? "+" + lastSearchScore.toFixed(2) : lastSearchScore.toFixed(2);
-    searchInfoLabel.textContent = "Depth " + lastSearchDepth + "  ·  Eval " + display + "  ·  " + lastSearchTimeMs + "ms";
+    searchInfoLabel.textContent =
+        "Depth " + lastSearchDepth + "  ·  Eval " + display + "  ·  " + lastSearchNodes.toLocaleString() + " nodes  ·  " + lastSearchTimeMs + "ms";
 }
 
 // `options.rootMoveSubset`, when given, restricts the root loop to searching
@@ -1841,6 +2063,7 @@ function playAi2(options) {
     const searchStartTime = Date.now();
     options = options || {};
     const usingSubset = !!options.rootMoveSubset;
+    lastSearchUnstable = false;
 
     if (!usingSubset) {
         const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
@@ -1848,6 +2071,7 @@ function playAi2(options) {
             lastSearchDepth = 0;
             lastSearchScore = null;
             lastSearchTimeMs = Date.now() - searchStartTime;
+            lastSearchNodes = 0;
             updateSearchInfo();
             return bookMove;
         }
@@ -1862,6 +2086,7 @@ function playAi2(options) {
         lastSearchDepth = 0;
         lastSearchScore = null;
         lastSearchTimeMs = Date.now() - searchStartTime;
+        lastSearchNodes = 0;
         updateSearchInfo();
         return null;
     }
@@ -1962,6 +2187,7 @@ function playAi2(options) {
                 // unmakeMove below this point will maintain incrementally in
                 // O(1), instead of resyncing from scratch on every node.
                 newBoardPos.__liveBB = syncBitboards(newBoardPos);
+                newBoardPos.__liveEval = computeLiveEval(newBoardPos);
                 let childWKPos = WhiteKingPos;
                 let childBKPos = BlackKingPos;
                 if (((move.piece) & 7) === King) {
@@ -2028,6 +2254,17 @@ function playAi2(options) {
             aspirationCenter = depthScore;
             lastSearchDepth = depth;
             lastSearchScore = whiteToMove ? depthScore : -depthScore; // always from White's perspective, matching the eval bar
+
+            // Unconditional (unlike the !usingSubset-gated extension just
+            // below): reflects "was the depth that just completed unstable"
+            // regardless of whether THIS call is a pooled subset worker or
+            // not, so the orchestrator (chess.js's requestAiMove) can decide
+            // -- across every worker's result -- whether the position
+            // looked unsettled anywhere in the pool, instead of each worker
+            // trying to extend itself individually (which is exactly what
+            // the gate below deliberately avoids, since Promise.all would
+            // then wait for whichever worker extends the longest).
+            lastSearchUnstable = !depthAborted && depth >= AI_EXTEND_MIN_DEPTH && (moveChanged || scoreDropped);
 
             // Only extend when NOT using a subset: with a small slice of the
             // full move list, "the best move among my few candidates

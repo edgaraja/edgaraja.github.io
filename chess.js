@@ -7,6 +7,7 @@ var defaultFEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
 // all) via ai-worker.js's importScripts, to run search off the main thread.
 var container = null;
 var gameRow = null;
+var buttonRow = null;
 var boardPosition = [];
 var whiteToMove = true;
 var nextMoves = [];
@@ -26,6 +27,30 @@ var playAsB = false;
 var halfMoveClock = 0;
 var positionHistory = new Map();
 var gameOver = false;
+// One entry per applied move (player's or AI's alike -- movePiece is the
+// single choke point both go through), each holding everything needed to
+// put the game back exactly as it was right before that move. Undo pops
+// from here rather than replaying moveToBoard/unmakeMove in reverse --
+// those are search-only machinery (tied to makeMoveStackDepth and the
+// incremental __liveBB/__liveEval hooks), not meant for arbitrary
+// user-driven rewinding of the real game state.
+var undoStack = [];
+var undoButton = null;
+// One SAN string per applied move, in exact 1:1 lockstep with undoStack --
+// both only ever grow (by one, inside movePiece) or get truncated together
+// (restoreSnapshot's undo path), so moveHistorySAN.length === undoStack.length
+// always holds.
+var moveHistorySAN = [];
+var moveHistoryPanel = null;
+// Pre-move state. premoveSelectedSquare/premoveCandidates are transient --
+// a piece has been picked during the AI's think time but no destination
+// confirmed yet. pendingPremove is the confirmed, queued move ({pos,
+// posTo, promotedType}, promotedType null for non-promotions) that fires
+// automatically (tryFirePremove) once it's genuinely the player's turn
+// again -- see movePiece's end-of-turn handling.
+var premoveSelectedSquare = null;
+var premoveCandidates = [];
+var pendingPremove = null;
 var evalBarWhiteFill = null;
 var evalBarLabel = null;
 var boardFlipped = false;
@@ -237,11 +262,14 @@ function evalToWhitePercent(score) {
     return Math.max(2, Math.min(98, percent));
 }
 
-// Instant static evaluation (no search) so this can update after every
-// move, human or AI, with no added delay.
-function updateEvalBar() {
-    if (!evalBarWhiteFill) return;
-    var score = Evaluate(true, boardPosition);
+// Driven entirely by the engine's own search result (lastSearchScore, from
+// White's perspective) rather than an instant static Evaluate() call -- a
+// raw material+PST snapshot recomputed after every ply was cheap but not
+// very meaningful next to what the AI actually calculated. Only ever
+// called from playAiTurn, right when a search finishes; a null score (book
+// move, or no search yet) just leaves the bar showing whatever it last did.
+function updateEvalBar(score) {
+    if (!evalBarWhiteFill || score === null || score === undefined) return;
     var whitePercent = evalToWhitePercent(score);
     evalBarWhiteFill.style.height = whitePercent + "%";
     evalBarLabel.textContent = score >= 0 ? "+" + score.toFixed(1) : score.toFixed(1);
@@ -284,7 +312,44 @@ function createFlipButton() {
         applyBoardOrientation();
         updateBoardLabels();
     });
-    container.appendChild(btn);
+    buttonRow.appendChild(btn);
+}
+
+// Only wired up for the two player-vs-AI entry points (playAsWhite/
+// playAsBlack below) -- AivsAi() never calls this, so the pure AI-vs-AI
+// page has no undo affordance at all, which makes sense since there's no
+// human move on that page to take back.
+function createUndoButton() {
+    var btn = document.createElement("button");
+    btn.textContent = "Undo";
+    btn.style.margin = "0";
+    btn.style.padding = "8px 20px";
+    btn.style.fontSize = "16px";
+    btn.style.background = "#a0452e";
+    btn.style.color = "#fff";
+    btn.style.border = "none";
+    btn.style.borderRadius = "4px";
+    btn.addEventListener("mouseenter", function () {
+        if (!btn.disabled) btn.style.background = "#7d3623";
+    });
+    btn.addEventListener("mouseleave", function () {
+        btn.style.background = "#a0452e";
+    });
+    btn.addEventListener("click", undoMove);
+    buttonRow.appendChild(btn);
+    undoButton = btn;
+    setUndoEnabled(false);
+}
+
+// Toggles both the real disabled state (so a click while empty/mid-search
+// can't even reach undoMove) and the visual cue -- disabled alone wouldn't
+// show through here since the button already sets its own explicit
+// background/color inline, overriding the browser's default dimming.
+function setUndoEnabled(enabled) {
+    if (!undoButton) return;
+    undoButton.disabled = !enabled;
+    undoButton.style.opacity = enabled ? "1" : "0.5";
+    undoButton.style.cursor = enabled ? "pointer" : "not-allowed";
 }
 
 // Shows the AI's own search depth and evaluation from its last move — unlike
@@ -613,6 +678,14 @@ function makeMove(move, board) {
         touchBB(undo, bb.all, move.posTo);
     }
 
+    // Optional forward dependency on ai.js, same guarded pattern already
+    // used by generatePieces's invalidateBitboardCache call: keeps this
+    // file loadable standalone (onMakeMove simply won't exist if ai.js
+    // hasn't loaded), while letting ai.js maintain its own incremental
+    // material+PST+phase state (board.__liveEval) in lockstep with every
+    // move, the same way __liveBB is maintained above.
+    if (typeof onMakeMove === "function") onMakeMove(board, move);
+
     return undo;
 }
 
@@ -630,6 +703,10 @@ function unmakeMove(undo, board) {
         if (sq < 32) bucket.lo ^= (1 << sq);
         else bucket.hi ^= (1 << (sq - 32));
     }
+    // Mirrors the onMakeMove hook above -- called BEFORE the decrement so
+    // makeMoveStackDepth still matches the value used by this same move's
+    // onMakeMove call (see ai.js's liveEvalPool indexing).
+    if (typeof onUnmakeMove === "function") onUnmakeMove(board);
     makeMoveStackDepth--;
 }
 
@@ -1247,30 +1324,16 @@ function checkInsufficientMaterial() {
 // always normalized to White's perspective (see ai.js), so this must take
 // the max when White is to move but the min when Black is, never a raw
 // cross-worker max.
-function requestAiMove() {
-    const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
-    if (bookMove) {
-        return Promise.resolve({ move: bookMove, lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: 0 });
-    }
-
-    const color = whiteToMove ? Black : White;
-    const rootMoves = sortMoves(
-        getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
-        boardPosition,
-        color,
-        null
-    );
-
-    const workerCount = aiWorkerPool.length;
-    const subsets = [];
-    for (let i = 0; i < workerCount; i++) subsets.push([]);
-    for (let i = 0; i < rootMoves.length; i++) subsets[i % workerCount].push(rootMoves[i]);
-
-    const deadline = Date.now() + AI_BASE_TIME_MS;
-    const hardDeadline = Date.now() + AI_MAX_TIME_MS;
-
+// Dispatches one round of root-move-subset searches, one message per
+// non-empty subset, to the matching pool worker -- exactly the request
+// shape/wiring requestAiMove always used before it could dispatch more than
+// one round. pendingAiRejects/worker.onerror are set up once per worker at
+// pool-creation time (see the aiWorkerPool loop below) and already tolerate
+// being paired with any number of requests to the same worker over time, so
+// nothing new is needed there for a second round.
+function dispatchSearchRound(subsets, deadline, hardDeadline) {
     const requests = [];
-    for (let i = 0; i < workerCount; i++) {
+    for (let i = 0; i < subsets.length; i++) {
         if (subsets[i].length === 0) continue;
         const worker = aiWorkerPool[i];
         requests.push(
@@ -1287,24 +1350,106 @@ function requestAiMove() {
             })
         );
     }
+    return Promise.all(requests);
+}
 
-    return Promise.all(requests).then((results) => {
-        let best = null;
-        let bestOriented = -Infinity;
-        let maxTimeMs = 0;
-        for (const r of results) {
-            if (r.lastSearchTimeMs > maxTimeMs) maxTimeMs = r.lastSearchTimeMs;
-            if (!r.move) continue;
-            const oriented = whiteToMove ? r.lastSearchScore : -r.lastSearchScore;
-            if (best === null || oriented > bestOriented) {
-                best = r;
-                bestOriented = oriented;
-            }
+// Reduces one round's per-worker results down to a single best move, by
+// whichever worker saw the best score oriented to the side to move --
+// exactly today's reduction, just reusable across as many rounds as
+// requestAiMove ends up dispatching.
+function pickBestResult(results) {
+    let best = null;
+    let bestOriented = -Infinity;
+    let maxTimeMs = 0;
+    // Root-splitting: each worker searched a disjoint slice of the root
+    // move list to its own full depth, so the total work behind this move
+    // is the SUM across the pool, not just whichever worker's slice
+    // happened to contain the best move.
+    let totalNodes = 0;
+    for (const r of results) {
+        if (r.lastSearchTimeMs > maxTimeMs) maxTimeMs = r.lastSearchTimeMs;
+        totalNodes += r.lastSearchNodes || 0;
+        if (!r.move) continue;
+        const oriented = whiteToMove ? r.lastSearchScore : -r.lastSearchScore;
+        if (best === null || oriented > bestOriented) {
+            best = r;
+            bestOriented = oriented;
         }
-        if (best === null) {
-            return { move: null, lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: maxTimeMs };
+    }
+    if (best === null) {
+        return { move: null, lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: maxTimeMs, lastSearchNodes: totalNodes };
+    }
+    return { move: best.move, lastSearchDepth: best.lastSearchDepth, lastSearchScore: best.lastSearchScore, lastSearchTimeMs: maxTimeMs, lastSearchNodes: totalNodes };
+}
+
+// Below this much remaining room before the hard ceiling, a second round
+// couldn't get meaningfully deeper than the first before hitting the same
+// wall again -- not worth the round-trip.
+const MIN_EXTENSION_MS = 500;
+
+function requestAiMove() {
+    const bookMove = getBookMove(boardPosition, whiteToMove, lastMove, WhiteKingPos, BlackKingPos);
+    if (bookMove) {
+        return Promise.resolve({ move: bookMove, lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: 0, lastSearchNodes: 0 });
+    }
+
+    const color = whiteToMove ? Black : White;
+    const rootMoves = sortMoves(
+        getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos),
+        boardPosition,
+        color,
+        null
+    );
+
+    // Exactly one legal move -- nothing to compare it against, so there's
+    // nothing a search could change about the decision. playAi2's own
+    // analogous shortcut (ai.js: `!usingSubset && rootMoves.length <= 1`)
+    // never fires in real play, since every dispatch below always hands a
+    // rootMoveSubset to every worker -- this is the orchestrator-level
+    // equivalent, same shape as the book-move check just above.
+    if (rootMoves.length === 1) {
+        return Promise.resolve({ move: rootMoves[0], lastSearchDepth: 0, lastSearchScore: null, lastSearchTimeMs: 0, lastSearchNodes: 0 });
+    }
+
+    const workerCount = aiWorkerPool.length;
+    const subsets = [];
+    for (let i = 0; i < workerCount; i++) subsets.push([]);
+    for (let i = 0; i < rootMoves.length; i++) subsets[i % workerCount].push(rootMoves[i]);
+
+    const requestStart = Date.now();
+    const deadline = requestStart + AI_BASE_TIME_MS;
+    const hardDeadline = requestStart + AI_MAX_TIME_MS;
+
+    // Each playAi2() call times itself from its OWN call-local
+    // searchStartTime (ai.js), so a worker's reported lastSearchTimeMs only
+    // ever reflects that one call's own duration -- for a round-2 dispatch,
+    // that's just round 2's stretch of time, not the cumulative wait since
+    // this function was first called. Overriding it here with the true
+    // elapsed time since requestStart, at whichever round actually produces
+    // the final answer, is what the UI (chess.js's playAiTurn -> ai.js's
+    // updateSearchInfo) should be showing the user.
+    function finalizeResult(result) {
+        result.lastSearchTimeMs = Date.now() - requestStart;
+        return result;
+    }
+
+    return dispatchSearchRound(subsets, deadline, hardDeadline).then((round1Results) => {
+        const unstable = round1Results.some((r) => r && r.lastSearchUnstable);
+        const remaining = hardDeadline - Date.now();
+        if (!unstable || remaining < MIN_EXTENSION_MS) {
+            return finalizeResult(pickBestResult(round1Results));
         }
-        return { move: best.move, lastSearchDepth: best.lastSearchDepth, lastSearchScore: best.lastSearchScore, lastSearchTimeMs: maxTimeMs };
+        // The position looked unsettled somewhere in the pool right as
+        // workers hit their base budget -- give everyone (same subsets, so
+        // each keeps building on its own now-warm transposition table
+        // instead of having its progress reshuffled to a different worker)
+        // the rest of the room up to AI_MAX_TIME_MS before actually
+        // committing to a move. This is the orchestrator-level replacement
+        // for playAi2's own per-worker instability extension, which never
+        // fires here since every dispatch always provides a
+        // rootMoveSubset -- see playAi2's `!usingSubset` gate on that logic
+        // and lastSearchUnstable's unconditional counterpart.
+        return dispatchSearchRound(subsets, hardDeadline, hardDeadline).then(pickBestResult).then(finalizeResult);
     });
 }
 
@@ -1319,7 +1464,9 @@ async function playAiTurn() {
         lastSearchDepth = result.lastSearchDepth;
         lastSearchScore = result.lastSearchScore;
         lastSearchTimeMs = result.lastSearchTimeMs;
+        lastSearchNodes = result.lastSearchNodes;
         updateSearchInfo();
+        updateEvalBar(lastSearchScore);
         aiThinking = false;
         if (result.move) {
             await movePiece(result.move);
@@ -1330,8 +1477,115 @@ async function playAiTurn() {
     }
 }
 
+// Square name for SAN purposes -- deliberately not reusing the existing
+// fileAt/rankAt helpers above, since (despite their names) fileAt actually
+// returns the RANK number and rankAt returns the FILE number; writing a
+// fresh, unambiguous helper here avoids inheriting that confusion.
+function sqName(sq) {
+    return "abcdefgh"[sq % 8] + (Math.floor(sq / 8) + 1);
+}
+
+const SAN_PIECE_LETTERS = {};
+SAN_PIECE_LETTERS[Knight] = "N";
+SAN_PIECE_LETTERS[Bishop] = "B";
+SAN_PIECE_LETTERS[Rook] = "R";
+SAN_PIECE_LETTERS[Queen] = "Q";
+SAN_PIECE_LETTERS[King] = "K";
+
+// Standard algebraic notation for one already-decided move. `preMoveLegal`
+// is the full legal move list for the moving side computed BEFORE this
+// move is applied (needed for disambiguation -- "is there another piece of
+// the same type that could also have reached this square"); `givesCheck`/
+// `isMate` describe the position AFTER the move, for the +/# suffix.
+function moveToSAN(move, preMoveLegal, givesCheck, isMate) {
+    let san;
+    if (move.isCastle) {
+        san = move.castleType === "s" ? "O-O" : "O-O-O";
+    } else {
+        const type = (move.piece) & 7;
+        const color = (move.piece) & 24;
+        const isCapture = ((move.attPiece) & 7) !== None || move.isEnp;
+        san = "";
+        if (type === Pawn) {
+            if (isCapture) san += "abcdefgh"[move.pos % 8] + "x";
+        } else {
+            san += SAN_PIECE_LETTERS[type];
+            // Disambiguation: another same-type, same-color piece that
+            // could also legally reach this exact destination needs its
+            // origin file/rank (or both) spelled out -- the standard SAN
+            // rule, checked in that preference order.
+            const others = preMoveLegal.filter(
+                (m) => m.pos !== move.pos && ((m.piece) & 7) === type && ((m.piece) & 24) === color && m.posTo === move.posTo
+            );
+            if (others.length > 0) {
+                const sameFile = others.some((m) => m.pos % 8 === move.pos % 8);
+                const sameRank = others.some((m) => Math.floor(m.pos / 8) === Math.floor(move.pos / 8));
+                if (!sameFile) san += "abcdefgh"[move.pos % 8];
+                else if (!sameRank) san += String(Math.floor(move.pos / 8) + 1);
+                else san += sqName(move.pos);
+            }
+            if (isCapture) san += "x";
+        }
+        san += sqName(move.posTo);
+        if (move.isPromoted) san += "=" + SAN_PIECE_LETTERS[(move.promotedTo) & 7];
+    }
+    if (isMate) san += "#";
+    else if (givesCheck) san += "+";
+    return san;
+}
+
+function renderMoveHistory() {
+    if (!moveHistoryPanel) return;
+    while (moveHistoryPanel.hasChildNodes()) moveHistoryPanel.removeChild(moveHistoryPanel.children[0]);
+    for (let i = 0; i < moveHistorySAN.length; i += 2) {
+        const row = document.createElement("div");
+        row.className = "move-history-row";
+        const num = document.createElement("span");
+        num.className = "move-history-num";
+        num.textContent = i / 2 + 1 + ".";
+        row.appendChild(num);
+        const whiteMove = document.createElement("span");
+        whiteMove.className = "move-history-move";
+        whiteMove.textContent = moveHistorySAN[i];
+        row.appendChild(whiteMove);
+        if (i + 1 < moveHistorySAN.length) {
+            const blackMove = document.createElement("span");
+            blackMove.className = "move-history-move";
+            blackMove.textContent = moveHistorySAN[i + 1];
+            row.appendChild(blackMove);
+        }
+        moveHistoryPanel.appendChild(row);
+    }
+    moveHistoryPanel.scrollTop = moveHistoryPanel.scrollHeight;
+}
+
+function createMoveHistoryPanel() {
+    const panel = document.createElement("div");
+    panel.className = "move-history";
+    gameRow.appendChild(panel);
+    moveHistoryPanel = panel;
+    renderMoveHistory();
+}
+
 async function movePiece(move) {
     if (gameOver) return;
+    undoStack.push({
+        boardPosition: boardPosition.slice(),
+        whiteToMove: whiteToMove,
+        lastMove: lastMove,
+        WhiteKingPos: WhiteKingPos,
+        BlackKingPos: BlackKingPos,
+        pieceCount: pieceCount,
+        halfMoveClock: halfMoveClock,
+        positionHistory: new Map(positionHistory),
+        moveCntr: moveCntr,
+    });
+    setUndoEnabled(true);
+    // Full legal move list for the moving side, BEFORE the move is applied
+    // -- needed for SAN disambiguation (moveToSAN below), which has to
+    // know what else could have reached this same destination.
+    const preMoveLegalForSAN = getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos);
+    const movedColorWasWhite = whiteToMove;
     invalidateBitboardCache(boardPosition);
     if (!move.isCastle && !move.isPromoted && !move.isEnp) {
         boardPosition[move.pos] = ((None) | (None) | ((false) ? 32 : 0));
@@ -1372,6 +1626,18 @@ async function movePiece(move) {
             WhiteKingPos = move.posTo;
         }
     }
+
+    // Computed once here and reused both for this move's SAN +/# suffix
+    // (right below) and by the checkmate/stalemate check further down --
+    // previously that block recomputed getAllMoves/getAttackedPosition/
+    // isChecked itself; this is the same work, just done once.
+    const legalMoves = getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos);
+    const attPosForCheck = getAttackedPosition(boardPosition, movedColorWasWhite ? White : Black);
+    const opponentKingPos = whiteToMove ? WhiteKingPos : BlackKingPos;
+    const givesCheck = isChecked(opponentKingPos, attPosForCheck);
+    moveHistorySAN.push(moveToSAN(move, preMoveLegalForSAN, givesCheck, legalMoves.length === 0));
+    renderMoveHistory();
+
     removeShowedMove2();
     let tile = document.getElementById(move.pos);
     let tileTo = document.getElementById(move.posTo);
@@ -1386,7 +1652,6 @@ async function movePiece(move) {
         tileTo.classList.add("lightClicked2");
     }
     showPiece(boardPosition);
-    updateEvalBar();
     await sleep(10);
 
     // Half-move clock: reset on any pawn move or capture, else increment
@@ -1417,13 +1682,10 @@ async function movePiece(move) {
         return;
     }
 
-    // Checkmate / stalemate: check if the side now to move has any legal moves
-    var legalMoves = getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos);
+    // Checkmate / stalemate: legalMoves/givesCheck already computed above
+    // (for the SAN suffix) and reused here rather than recomputed.
     if (legalMoves.length === 0) {
-        var attackingColor = whiteToMove ? Black : White;
-        var kingPos = whiteToMove ? WhiteKingPos : BlackKingPos;
-        var attPos = getAttackedPosition(boardPosition, attackingColor);
-        if (isChecked(kingPos, attPos)) {
+        if (givesCheck) {
             showGameOver("Checkmate — " + (whiteToMove ? "Black" : "White") + " wins!");
         } else {
             showGameOver("Stalemate — Draw");
@@ -1434,11 +1696,75 @@ async function movePiece(move) {
     moveCntr++;
     if (playAsW && !whiteToMove) {
         await playAiTurn();
-    }
-    if (playAsB && whiteToMove) {
+    } else if (playAsB && whiteToMove) {
         await playAiTurn();
+    } else {
+        // Genuinely the human's turn again -- either this call just applied
+        // the AI's own reply (reached via the recursive movePiece call
+        // inside playAiTurn above), or there's no AI turn to hand off to at
+        // all. Any premove selection highlight left over from choosing
+        // during the AI's think time is now stale (computed against the
+        // pre-reply board) and gets cleared regardless of outcome; a
+        // CONFIRMED premove gets its real, only legality check here.
+        clearPremoveSelectionHighlight();
+        await tryFirePremove();
     }
     removeEventListener();
+}
+
+function undoMove() {
+    if (aiThinking || undoStack.length === 0) return;
+    // A player's move is always immediately followed by the AI's reply --
+    // movePiece awaits playAiTurn to completion before control ever returns
+    // to the UI -- so whenever this button is actually clickable, the top
+    // of the stack is normally the AI's just-played reply, with the
+    // position right before the player's own move sitting one entry
+    // beneath it. Discard the top one and restore the one under it, so
+    // Undo takes back the whole exchange and lands back on the player's
+    // turn, rather than on the single ply where the AI just hasn't
+    // answered yet. The one leftover case (a single entry) is the AI's own
+    // opening move in a playAsBlack game, before the player has moved at
+    // all -- restoring that just resets to the starting position.
+    if (undoStack.length >= 2) undoStack.pop();
+    restoreSnapshot(undoStack.pop());
+}
+
+function restoreSnapshot(snap) {
+    boardPosition = snap.boardPosition;
+    whiteToMove = snap.whiteToMove;
+    lastMove = snap.lastMove;
+    WhiteKingPos = snap.WhiteKingPos;
+    BlackKingPos = snap.BlackKingPos;
+    pieceCount = snap.pieceCount;
+    halfMoveClock = snap.halfMoveClock;
+    positionHistory = snap.positionHistory;
+    moveCntr = snap.moveCntr;
+    gameOver = false;
+    invalidateBitboardCache(boardPosition);
+
+    var overlay = document.querySelector(".game-over-overlay");
+    if (overlay) overlay.remove();
+
+    removeShowedMove();
+    removeShowedMove2();
+    removeEventListener();
+    nextMoves = [];
+    showPiece(boardPosition);
+    setUndoEnabled(undoStack.length > 0);
+    // moveHistorySAN grows in exact lockstep with undoStack (see its
+    // declaration) -- truncating to the same length undoes the same moves.
+    moveHistorySAN.length = undoStack.length;
+    renderMoveHistory();
+
+    // Re-apply the "last move" highlight for whichever move is now on top,
+    // exactly like movePiece does right after applying a move -- or leave
+    // the board unmarked if this undo rewound all the way to the start.
+    if (lastMove.piece !== None) {
+        var tile = document.getElementById(lastMove.pos);
+        var tileTo = document.getElementById(lastMove.posTo);
+        tile.classList.add(tile.getAttribute("tilecolor") == "dark" ? "darkClicked2" : "lightClicked2");
+        tileTo.classList.add(tileTo.getAttribute("tilecolor") == "dark" ? "darkClicked2" : "lightClicked2");
+    }
 }
 
 function showedMoveClicked(e) {
@@ -1621,12 +1947,126 @@ function showMoveList(moveList) {
     });
 }
 
+// Clears the transient "piece selected, choosing a premove target" state
+// and its highlight -- NOT the confirmed pendingPremove (see clearPremove
+// for that). Safe to call whether or not a selection is actually open.
+function clearPremoveSelectionHighlight() {
+    if (premoveSelectedSquare !== null) {
+        document.getElementById(premoveSelectedSquare).classList.remove("premoveSelected");
+    }
+    for (const m of premoveCandidates) {
+        const t = document.getElementById(m.posTo);
+        t.classList.remove("premoveTarget");
+        t.classList.remove("premoveTargetCapture");
+    }
+    premoveSelectedSquare = null;
+    premoveCandidates = [];
+}
+
+function armPremove(pos, posTo, promotedType) {
+    pendingPremove = { pos: pos, posTo: posTo, promotedType: promotedType };
+    document.getElementById(pos).classList.add("premoveArmed");
+    document.getElementById(posTo).classList.add("premoveArmed");
+}
+
+// Clears a CONFIRMED, queued premove and its highlight. Safe to call when
+// there isn't one.
+function clearPremove() {
+    if (pendingPremove === null) return;
+    document.getElementById(pendingPremove.pos).classList.remove("premoveArmed");
+    document.getElementById(pendingPremove.posTo).classList.remove("premoveArmed");
+    pendingPremove = null;
+}
+
+// Routes every board click while the AI is thinking. Kept entirely
+// separate from the live-turn selection logic below (showMove's own
+// listener body) rather than branching inside it -- lower risk to the
+// already-working move flow, since that logic is now only ever reachable
+// when aiThinking is false.
+function handlePremoveClick(pcs, i) {
+    // Confirm: clicking one of the currently-selected piece's highlighted
+    // candidate squares.
+    if (premoveSelectedSquare !== null && (pcs.classList.contains("premoveTarget") || pcs.classList.contains("premoveTargetCapture"))) {
+        const candidates = premoveCandidates.filter((m) => m.posTo === i);
+        if (candidates.length > 0) {
+            // Promotions: getAllMoves hands back 4 variants (Q/R/B/N) for
+            // the same (pos,posTo) -- premove always auto-queens, same as
+            // chess.com, rather than showing a piece-picker mid-premove
+            // (which would defeat the point of premoving instantly).
+            const chosen = candidates.find((m) => !m.isPromoted) || candidates.find((m) => ((m.promotedTo) & 7) === Queen) || candidates[0];
+            clearPremoveSelectionHighlight();
+            armPremove(chosen.pos, chosen.posTo, chosen.isPromoted ? (chosen.promotedTo) & 7 : null);
+        }
+        return;
+    }
+    // Cancel: clicking the already-armed premove's own "from" square again.
+    if (pendingPremove !== null && pendingPremove.pos === i) {
+        clearPremove();
+        return;
+    }
+    // (Re)select: clicking one of the player's own pieces. Starting a new
+    // selection always replaces any previously-armed premove.
+    const myColor = playAsW ? White : Black;
+    if (pcs.getAttribute("type") != None && (pcs.getAttribute("color") - 0) === myColor) {
+        const wasSelected = premoveSelectedSquare === i;
+        clearPremove();
+        clearPremoveSelectionHighlight();
+        if (wasSelected) return; // re-clicking the same piece just deselects
+        // Hypothetical "what would be legal for me right now" -- getAllMoves
+        // takes WTM explicitly rather than reading the live whiteToMove
+        // global (proven side-agnostic by the search itself, ai.js, which
+        // calls it for both colors regardless of whose turn it really is),
+        // so this is safe to compute against the CURRENT board even though
+        // it's actually the opponent's turn.
+        const candidates = getAllMoves(playAsW, boardPosition, lastMove, WhiteKingPos, BlackKingPos).filter((m) => m.pos === i);
+        if (candidates.length === 0) return;
+        premoveSelectedSquare = i;
+        premoveCandidates = candidates;
+        pcs.classList.add("premoveSelected");
+        const seenTo = new Set();
+        for (const m of candidates) {
+            if (seenTo.has(m.posTo)) continue; // 4 promotion variants share one destination square
+            seenTo.add(m.posTo);
+            const t = document.getElementById(m.posTo);
+            t.classList.add(((m.attPiece) & 7) !== None || m.isEnp ? "premoveTargetCapture" : "premoveTarget");
+        }
+        return;
+    }
+    // Clicked something irrelevant (empty square, opponent piece) with no
+    // premove selection open to confirm -- just clear any stale transient
+    // selection.
+    clearPremoveSelectionHighlight();
+}
+
+// The real (second) legality check: only a move that's still legal against
+// the ACTUAL position once it's genuinely the player's turn again ever
+// gets played. A premove the AI's reply invalidated (blocked, captured,
+// opened a new check) is silently dropped here -- never force-applied.
+async function tryFirePremove() {
+    if (pendingPremove === null) return;
+    const premove = pendingPremove;
+    clearPremove();
+    const legal = getAllMoves(whiteToMove, boardPosition, lastMove, WhiteKingPos, BlackKingPos);
+    const match = legal.find(
+        (m) =>
+            m.pos === premove.pos &&
+            m.posTo === premove.posTo &&
+            (premove.promotedType === null ? !m.isPromoted : m.isPromoted && ((m.promotedTo) & 7) === premove.promotedType)
+    );
+    if (match) await movePiece(match);
+}
+
 function showMove() {
     for (let i = 0; i < 64; i++) {
         let pcs = document.getElementById(i);
         pcs.addEventListener("mousedown", function (e) {
-            if (gameOver || aiThinking) return;
-            if (e.button == 0) {
+            if (gameOver) return;
+            if (e.button != 0) return;
+            if (aiThinking) {
+                handlePremoveClick(pcs, i);
+                return;
+            }
+            {
                 if (pcs.classList.contains("moveList") || pcs.classList.contains("moveListCapture")) {
                     removeShowedMove();
                 } else if (pcs.getAttribute("type") != None) {
@@ -1762,6 +2202,7 @@ function getEval() {
 
 function playAsWhite() {
     playAsW = true;
+    createUndoButton();
 }
 
 async function playAsBlack() {
@@ -1770,6 +2211,7 @@ async function playAsBlack() {
     // respond to Black's next reply, so it needs to already be true by the
     // time that check runs.
     playAsB = true;
+    createUndoButton();
     await playAiTurn();
 }
 
@@ -1814,8 +2256,16 @@ if (typeof document !== "undefined") {
     gameRow.className = "game-row";
     container.appendChild(gameRow);
 
+    // Flip Board + Undo side by side in one row, instead of each stacking as
+    // its own full row below the board -- keeps the whole game area short
+    // enough to not need scrolling to reach the controls.
+    buttonRow = document.createElement("div");
+    buttonRow.className = "button-row";
+    container.appendChild(buttonRow);
+
     createEvalBar();
     createBoard();
+    createMoveHistoryPanel();
     createFlipButton();
     createSearchInfoLabel();
     applyBoardOrientation();
@@ -1847,10 +2297,11 @@ if (typeof document !== "undefined") {
         aiWorkerPool.push(worker);
     }
 
-    // Seed position history and the eval bar's initial reading.
-    // Runs after ai.js is loaded so computeHash/Evaluate are available.
+    // Seed position history. Runs after ai.js is loaded so computeHash is
+    // available. The eval bar itself starts at its static "0.0" default
+    // (createEvalBar) and only ever updates from a real engine result
+    // (playAiTurn), so there's nothing to seed for it here.
     window.addEventListener("load", function () {
         positionHistory.set(computeHash(boardPosition, whiteToMove), 1);
-        updateEvalBar();
     });
 }
